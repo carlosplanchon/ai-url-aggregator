@@ -19,6 +19,8 @@
 4. **Relevance Ranking**  
    - Uses an OpenAI model to select the most important websites from the deduplicated list of online URLs.
 
+### DeepWiki Docs: [https://deepwiki.com/carlosplanchon/ai_url_aggregator](https://deepwiki.com/carlosplanchon/ai_url_aggregator)
+
 ---
 
 ## Installation
