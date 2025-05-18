@@ -1,7 +1,6 @@
-```markdown
 # ai_url_aggregator
 
-> **Note**: *This is a small experimental library, provided as-is.
+> **Note**: *This is a small experimental library, provided as-is.*
 
 **ai_url_aggregator** is a Python tool that leverages **Perplexity** and **OpenAI** to search the internet for relevant URLs, filter and deduplicate them, check their availability, and then select the most important ones based on GPT analysis.
 
@@ -109,6 +108,16 @@ most_important_websites = get_top_relevant_websites(website_urls=online_urls)
 
 print("--- Most Important Websites ---")
 prettyprinter.cpprint(most_important_websites)
+```
+
+Result (Main real state agencies in Uruguay):
+```python
+[
+    'https://www.infocasas.com.uy',
+    'https://www.casasweb.com.uy',
+    'https://www.mercadolibre.com.uy/inmuebles',
+    'https://www.uruguayinmobiliarias.com'
+]
 ```
 
 ---

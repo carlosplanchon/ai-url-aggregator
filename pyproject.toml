@@ -12,7 +12,7 @@ version = "0.1"
 authors = [
     {name = "Carlos A. Planchón", email = "carlosandresplanchonprestes@gmail.com"}
 ]
-description = "Extracts all text results from an XPath query on a parsel Selector object."
+description = "Tool that uses Perplexity and OpenAI to search with SERP and filter for relevant URLs."
 classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Build Tools",
