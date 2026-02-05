@@ -27,7 +27,7 @@
 ### 1. Install via PyPI
 
 ```bash
-pip install ai_url_aggregator
+uv add ai_url_aggregator
 ```
 
 ### 2. Set Environment Variables
@@ -46,7 +46,7 @@ Replace `"PERPLEXITY_API_KEY"` and `"OPENAI_API_KEY"` with your actual API keys.
 1. **Clone or Download** this repository.  
 2. **Install Dependencies**:
    ```bash
-   pip install -r requirements.txt
+   uv sync
    ```
    This ensures all required libraries (like `openai`, `requests`, etc.) are installed.
 
