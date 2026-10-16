@@ -3,42 +3,41 @@
 import ipaddress
 import json
 import logging
-import os
-import re
 import socket
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from functools import cache, partial
-from typing import TypeVar
+from typing import Literal, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
-from openai import OpenAI, OpenAIError
+from openai import OpenAI
+from perplexity import Perplexity
 from pydantic import BaseModel, Field, ValidationError
 from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
 
-PERPLEXITY_BASE_URL = "https://api.perplexity.ai/v1"
-# The Agent API's counterpart of the sonar-reasoning-pro model.
-DEFAULT_PERPLEXITY_PRESET = "medium"
 DEFAULT_OPENAI_MODEL = "gpt-6-luna"
 DEFAULT_OPENAI_REASONING_EFFORT = "low"
 
+# Limits of Perplexity's Search API.
+MAX_QUERIES_PER_REQUEST = 5
+MAX_RESULTS_PER_QUERY = 20
+
+# Page text asked for per result, and sent to the model when ranking: enough
+# to judge a page, little enough to rank many.
+_PAGE_TOKENS = 128
+_SNIPPET_CHARS = 500
+
 # Final statuses that count as online; 403 usually means bot protection.
 ONLINE_STATUS_CODES = frozenset({200, 403})
-MAX_PARALLEL_QUERIES = 5
 
 
 @cache
-def _default_perplexity_client() -> OpenAI:
-    api_key = os.environ.get("PERPLEXITY_API_KEY")
-    if not api_key:
-        # Given no key, the SDK would fall back to OPENAI_API_KEY and send it
-        # to Perplexity.
-        raise RuntimeError(
-            "PERPLEXITY_API_KEY is not set; export it or pass perplexity_client."
-        )
-    return OpenAI(api_key=api_key, base_url=PERPLEXITY_BASE_URL)
+def _default_perplexity_client() -> Perplexity:
+    # Reads PERPLEXITY_API_KEY and raises PerplexityError if it is not set.
+    return Perplexity()
 
 
 @cache
@@ -47,62 +46,33 @@ def _default_openai_client() -> OpenAI:
     return OpenAI()
 
 
-class UrlList(BaseModel):
-    urls: list[str]
+class SearchResult(BaseModel):
+    """A web page found by the search, with its title and an extract."""
+
+    url: str
+    title: str = ""
+    snippet: str = ""
 
 
-# The Agent API presets cite sources by number ([web:1]) instead of by URL,
-# so the answer would otherwise have few URLs to extract.
-_URL_REQUEST = "Include the full website URL of each item you mention."
-_CITATION_RE = re.compile(r"\[[a-z_]+:\d+\]")
-
-# Perplexity's output items that list web pages, and the field with the list.
-_SOURCE_FIELDS = {"search_results": "results", "fetch_url_results": "contents"}
+class QueryList(BaseModel):
+    queries: list[str]
 
 
-def _search_result_urls(response) -> list[str]:
-    """URLs of the pages Perplexity found or fetched while answering."""
-    urls = []
-    for item in response.output:
-        field = _SOURCE_FIELDS.get(item.type)
-        if field is None:
-            continue
-        # The OpenAI SDK doesn't know these items, so it leaves their entries
-        # as dicts; Perplexity's SDK makes objects.
-        for source in getattr(item, field, None) or []:
-            if isinstance(source, dict):
-                url = source.get("url")
-            else:
-                url = getattr(source, "url", None)
-            if isinstance(url, str):
-                urls.append(url)
-    return urls
-
-
-def _ask_perplexity(
-    client: OpenAI, query: str, *, preset: str, model: str | None
-):
-    """Ask Perplexity's Agent API about `query`, requesting URLs too.
-
-    `model`, if given, replaces the preset's. A failed answer raises
-    OpenAIError; an otherwise unfinished one is logged and returned as is.
-    """
-    options = {} if model is None else {"model": model}
-    response = client.responses.create(
-        input=f"{query}\n\n{_URL_REQUEST}",
-        # The OpenAI SDK has no parameter for Perplexity's presets.
-        extra_body={"preset": preset},
-        **options,
-    )
-    if response.status == "failed":
-        message = getattr(response.error, "message", None)
-        raise OpenAIError(f"Perplexity failed to answer: {message}")
-    if response.status != "completed":
-        logger.warning(
-            "Perplexity did not complete its answer (status: %s)",
-            response.status,
+class Website(BaseModel):
+    name: str = Field(description="The name of the website.")
+    url: str = Field(description="The url of the website.")
+    kind: Literal["official_site", "directory", "article", "other"] = Field(
+        description=(
+            "official_site: the site of the entity itself; directory: a "
+            "listing of many entities; article: news or reference content."
         )
-    return response
+    )
+
+
+class WebsiteList(BaseModel):
+    websites_list: list[Website] = Field(
+        description="The relevant websites, most relevant first."
+    )
 
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
@@ -174,62 +144,78 @@ def _parse_structured(
     return parsed
 
 
-def query_models(
+def expand_query(
     query: str,
+    num_queries: int = MAX_QUERIES_PER_REQUEST,
     *,
-    perplexity_preset: str = DEFAULT_PERPLEXITY_PRESET,
-    perplexity_model: str | None = None,
     openai_model: str = DEFAULT_OPENAI_MODEL,
     openai_reasoning_effort: str | None = DEFAULT_OPENAI_REASONING_EFFORT,
     openai_temperature: float | None = None,
-    include_search_results: bool = True,
-    perplexity_client: OpenAI | None = None,
     openai_client: OpenAI | None = None,
 ) -> list[str]:
-    """Ask Perplexity about `query` and return the URLs it comes up with.
+    """Return `query` followed by up to `num_queries - 1` related queries.
 
-    Perplexity answers through its Agent API with `perplexity_preset`;
-    `perplexity_model`, if given, replaces the preset's model. An OpenAI
-    model extracts the URLs mentioned in the answer; if it refuses or its
-    output is cut off, that is logged and no URLs are extracted. With
-    `include_search_results`, the pages Perplexity found are added too.
-    For an OpenAI model without reasoning, such as gpt-4o, pass
-    `openai_reasoning_effort=None` (and optionally `openai_temperature=0`).
+    An OpenAI model writes the extra queries, varying the wording, language
+    and angle to find more of the websites `query` asks for. If it refuses
+    or its output is cut off, that is logged and only `query` is returned.
     """
-    if perplexity_client is None:
-        perplexity_client = _default_perplexity_client()
-    if openai_client is None:
-        openai_client = _default_openai_client()
-
-    response = _ask_perplexity(
-        perplexity_client,
-        query,
-        preset=perplexity_preset,
-        model=perplexity_model,
-    )
-    answer = _CITATION_RE.sub("", response.output_text).strip()
-    logger.debug("Perplexity answer:\n%s", answer)
-
-    urls: list[str] = []
-    if answer:
-        url_list = _parse_structured(
+    if num_queries < 1:
+        raise ValueError("num_queries must be at least 1")
+    queries = [query]
+    if num_queries > 1:
+        if openai_client is None:
+            openai_client = _default_openai_client()
+        query_list = _parse_structured(
             openai_client,
             model=openai_model,
             instructions=(
-                "Extract every website URL mentioned in the text. "
-                "Copy them exactly and do not invent any."
+                f"Write {num_queries - 1} web search queries that, together "
+                "with the user's request, find as many of the websites it asks "
+                "for as possible. Vary the wording, use the local language of "
+                "any place involved, and include queries for directories or "
+                "listings of them."
             ),
-            user_input=answer,
-            text_format=UrlList,
+            user_input=query,
+            text_format=QueryList,
             temperature=openai_temperature,
             reasoning_effort=openai_reasoning_effort,
         )
-        if url_list is not None:
-            urls.extend(url_list.urls)
+        if query_list is not None:
+            queries.extend(query_list.queries)
+    # A dict drops repeats while keeping the order.
+    unique = dict.fromkeys(q.strip() for q in queries if q.strip())
+    return list(unique)[:num_queries]
 
-    if include_search_results:
-        urls.extend(_search_result_urls(response))
-    return urls
+
+def search_web(
+    queries: Sequence[str],
+    *,
+    max_results: int = MAX_RESULTS_PER_QUERY,
+    country: str | None = None,
+    perplexity_client: Perplexity | None = None,
+) -> list[SearchResult]:
+    """Run `queries` through Perplexity's Search API and return the results.
+
+    Queries go MAX_QUERIES_PER_REQUEST to a request, and each request is
+    billed once. `country`, an ISO 3166-1 alpha-2 code such as "UY", favors
+    results from that country.
+    """
+    if perplexity_client is None:
+        perplexity_client = _default_perplexity_client()
+    options = {} if country is None else {"country": country}
+    results: list[SearchResult] = []
+    for start in range(0, len(queries), MAX_QUERIES_PER_REQUEST):
+        response = perplexity_client.search.create(
+            query=list(queries[start : start + MAX_QUERIES_PER_REQUEST]),
+            max_results=max_results,
+            max_tokens_per_page=_PAGE_TOKENS,
+            **options,
+        )
+        results.extend(
+            SearchResult(url=result.url, title=result.title, snippet=result.snippet)
+            for result in response.results
+        )
+    return results
 
 
 def normalize_url(url: str) -> str | None:
@@ -270,92 +256,31 @@ def _dedup_key(normalized_url: str) -> str:
     return urlunsplit(("", host, parts.path, parts.query, ""))
 
 
+def _unique_results(results: Iterable[SearchResult]) -> list[SearchResult]:
+    """Normalize and deduplicate results the way keep_https does URLs."""
+    kept: dict[str, SearchResult] = {}
+    for result in results:
+        normalized = normalize_url(result.url)
+        if normalized is None:
+            logger.debug("Discarding non-web URL: %r", result.url)
+            continue
+        key = _dedup_key(normalized)
+        if key not in kept or (
+            kept[key].url.startswith("http://")
+            and normalized.startswith("https://")
+        ):
+            kept[key] = result.model_copy(update={"url": normalized})
+    return list(kept.values())
+
+
 def keep_https(urls: list[str]) -> list[str]:
     """Normalize and deduplicate URLs, preferring https:// over http://.
 
     "www.example.com" and "example.com" count as the same site. Strings that
     are not http(s) URLs are dropped. The order of first appearance is kept.
     """
-    kept: dict[str, str] = {}
-    for url in urls:
-        normalized = normalize_url(url)
-        if normalized is None:
-            logger.debug("Discarding non-web URL: %r", url)
-            continue
-        key = _dedup_key(normalized)
-        if key not in kept or (
-            kept[key].startswith("http://")
-            and normalized.startswith("https://")
-        ):
-            kept[key] = normalized
-    return list(kept.values())
-
-
-def execute_query_multiple_times(
-    query: str,
-    num_runs: int = 5,
-    *,
-    perplexity_preset: str = DEFAULT_PERPLEXITY_PRESET,
-    perplexity_model: str | None = None,
-    openai_model: str = DEFAULT_OPENAI_MODEL,
-    openai_reasoning_effort: str | None = DEFAULT_OPENAI_REASONING_EFFORT,
-    openai_temperature: float | None = None,
-    include_search_results: bool = True,
-    perplexity_client: OpenAI | None = None,
-    openai_client: OpenAI | None = None,
-) -> list[str]:
-    """Run `query_models` `num_runs` times in parallel and merge the URLs.
-
-    URLs are normalized and deduplicated in the order they were found.
-    Runs that hit an API error are logged and skipped; if every run fails,
-    the first error is raised.
-    """
-    if num_runs < 1:
-        raise ValueError("num_runs must be at least 1")
-    # Resolve the clients once, so a missing API key fails fast.
-    if perplexity_client is None:
-        perplexity_client = _default_perplexity_client()
-    if openai_client is None:
-        openai_client = _default_openai_client()
-    run_query = partial(
-        query_models,
-        query,
-        perplexity_preset=perplexity_preset,
-        perplexity_model=perplexity_model,
-        openai_model=openai_model,
-        openai_reasoning_effort=openai_reasoning_effort,
-        openai_temperature=openai_temperature,
-        include_search_results=include_search_results,
-        perplexity_client=perplexity_client,
-        openai_client=openai_client,
-    )
-
-    logger.info("Running the query %d times", num_runs)
-    workers = min(num_runs, MAX_PARALLEL_QUERIES)
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(run_query) for _ in range(num_runs)]
-
-    results: list[list[str]] = []
-    errors: list[OpenAIError] = []
-    for future in futures:
-        try:
-            results.append(future.result())
-        except OpenAIError as exc:
-            errors.append(exc)
-    if not results:
-        raise errors[0]
-    for exc in errors:
-        logger.warning("A query run failed and was skipped: %s", exc)
-
-    # A dict keeps the order in which the URLs were first found.
-    unique_urls = dict.fromkeys(
-        normalized
-        for urls in results
-        for normalized in map(normalize_url, urls)
-        if normalized is not None
-    )
-    logger.info("Found %d unique URLs", len(unique_urls))
-    return list(unique_urls)
+    results = _unique_results(SearchResult(url=url) for url in urls)
+    return [result.url for result in results]
 
 
 def _is_global_ip(address: str) -> bool:
@@ -456,44 +381,46 @@ def check_urls_online(
 
 def search_for_web_urls(
     query: str,
-    num_runs: int = 5,
+    num_queries: int = MAX_QUERIES_PER_REQUEST,
     *,
-    perplexity_preset: str = DEFAULT_PERPLEXITY_PRESET,
-    perplexity_model: str | None = None,
+    max_results: int = MAX_RESULTS_PER_QUERY,
+    country: str | None = None,
     openai_model: str = DEFAULT_OPENAI_MODEL,
     openai_reasoning_effort: str | None = DEFAULT_OPENAI_REASONING_EFFORT,
     openai_temperature: float | None = None,
-    include_search_results: bool = True,
-    perplexity_client: OpenAI | None = None,
+    perplexity_client: Perplexity | None = None,
     openai_client: OpenAI | None = None,
-) -> list[str]:
-    """Find URLs for `query`, deduplicate them and keep the online ones."""
-    urls = execute_query_multiple_times(
+) -> list[SearchResult]:
+    """Search the web for `query` and return the online, unique results.
+
+    `query` is expanded into `num_queries` queries (see expand_query), which
+    Perplexity's Search API runs; the results are then normalized,
+    deduplicated and checked online.
+    """
+    queries = expand_query(
         query,
-        num_runs,
-        perplexity_preset=perplexity_preset,
-        perplexity_model=perplexity_model,
+        num_queries,
         openai_model=openai_model,
         openai_reasoning_effort=openai_reasoning_effort,
         openai_temperature=openai_temperature,
-        include_search_results=include_search_results,
-        perplexity_client=perplexity_client,
         openai_client=openai_client,
     )
-    return check_urls_online(keep_https(urls))
-
-
-class Website(BaseModel):
-    name: str = Field(description="The name of the website.")
-    url: str = Field(description="The url of the website.")
-
-
-class WebsiteList(BaseModel):
-    websites_list: list[Website] = Field(description="A short list.")
+    logger.info("Searching with %d queries: %s", len(queries), queries)
+    results = _unique_results(
+        search_web(
+            queries,
+            max_results=max_results,
+            country=country,
+            perplexity_client=perplexity_client,
+        )
+    )
+    online = set(check_urls_online([result.url for result in results]))
+    logger.info("%d of %d unique results are online", len(online), len(results))
+    return [result for result in results if result.url in online]
 
 
 def get_top_relevant_websites(
-    website_urls: list[str],
+    results: Sequence[SearchResult | str],
     query: str | None = None,
     *,
     openai_model: str = DEFAULT_OPENAI_MODEL,
@@ -501,14 +428,19 @@ def get_top_relevant_websites(
     openai_temperature: float | None = None,
     openai_client: OpenAI | None = None,
 ) -> list[Website]:
-    """Ask an OpenAI model for the most relevant websites in `website_urls`.
+    """Ask an OpenAI model which `results` are relevant, most relevant first.
 
-    Pass the original `query` so the model knows what to rank for. Only
-    websites from `website_urls` are returned, with the URL as given there.
-    If the model refuses or its output is cut off, that is logged and the
-    result is empty.
+    The model judges each page by its title and snippet and classifies it.
+    Pass the original `query` so it knows what to rank for. Plain URLs are
+    accepted too. Only websites from `results` are returned, with the URL as
+    given there. If the model refuses or its output is cut off, that is
+    logged and the result is empty.
     """
-    if not website_urls:
+    candidates = [
+        result if isinstance(result, SearchResult) else SearchResult(url=result)
+        for result in results
+    ]
+    if not candidates:
         return []
     if openai_client is None:
         openai_client = _default_openai_client()
@@ -516,16 +448,26 @@ def get_top_relevant_websites(
     task = "Select the most important websites from this JSON list."
     if query:
         task = (
-            "Select the websites from this JSON list that are most relevant "
-            f"to the following query.\nQuery: {query}"
+            "Select the websites from this JSON list that are relevant to "
+            f"the following query.\nQuery: {query}"
         )
+    pages = [
+        {
+            "url": candidate.url,
+            "title": candidate.title,
+            "snippet": candidate.snippet[:_SNIPPET_CHARS],
+        }
+        for candidate in candidates
+    ]
     website_list = _parse_structured(
         openai_client,
         model=openai_model,
         instructions=(
-            f"{task}\nReturn a short list, using only URLs from the list."
+            f"{task}\nJudge each one by its title and snippet, classify it, "
+            "and order them from most to least relevant. Use only URLs from "
+            "the list."
         ),
-        user_input=json.dumps(website_urls),
+        user_input=json.dumps(pages, ensure_ascii=False),
         text_format=WebsiteList,
         temperature=openai_temperature,
         reasoning_effort=openai_reasoning_effort,
@@ -535,10 +477,10 @@ def get_top_relevant_websites(
 
     # Map the model's URLs back to the input ones, dropping any made up.
     originals: dict[str, str] = {}
-    for url in website_urls:
-        normalized = normalize_url(url)
+    for candidate in candidates:
+        normalized = normalize_url(candidate.url)
         if normalized is not None:
-            originals.setdefault(_dedup_key(normalized), url)
+            originals.setdefault(_dedup_key(normalized), candidate.url)
     selected: dict[str, Website] = {}
     for website in website_list.websites_list:
         normalized = normalize_url(website.url)

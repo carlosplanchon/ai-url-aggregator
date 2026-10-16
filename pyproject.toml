@@ -26,6 +26,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies=[
     "openai>=1.92",
+    "perplexityai>=0.20",
     "pydantic>=2",
     "requests"
 ]

@@ -1,5 +1,4 @@
 import inspect
-import itertools
 import json
 import os
 import subprocess
@@ -11,7 +10,8 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import pytest
-from openai import OpenAI, OpenAIError
+from openai import OpenAI
+from perplexity import Perplexity, PerplexityError
 
 import ai_url_aggregator as agg
 
@@ -27,24 +27,23 @@ DEFAULT_OPENAI_KWARGS = {
 
 
 class FakeClient:
-    """Stands in for openai.OpenAI and records the API calls it gets.
+    """Stands in for the OpenAI and Perplexity clients and records calls.
 
-    Perplexity is called through responses.create and OpenAI through
-    responses.parse. `create` and `parse` are the responses to return, or
+    OpenAI is called through responses.parse and Perplexity through
+    search.create. `parse` and `search` are the responses to return, or
     callables that produce them (and may raise).
     """
 
-    def __init__(self, create=None, parse=None):
+    def __init__(self, parse=None, search=None):
         self.calls = []
-        self._responses = {"create": create, "parse": parse}
-        # No chat attribute: neither API is called through Chat Completions.
-        self.responses = SimpleNamespace(create=self.create, parse=self.parse)
-
-    def create(self, **kwargs):
-        return self._respond("create", kwargs)
-
-    def parse(self, **kwargs):
-        return self._respond("parse", kwargs)
+        self._responses = {"parse": parse, "search": search}
+        # Expose each method only where the SDKs have it.
+        self.responses = SimpleNamespace(
+            parse=lambda **kwargs: self._respond("parse", kwargs)
+        )
+        self.search = SimpleNamespace(
+            create=lambda **kwargs: self._respond("search", kwargs)
+        )
 
     def _respond(self, method, kwargs):
         self.calls.append((method, kwargs))
@@ -52,25 +51,13 @@ class FakeClient:
         return response() if callable(response) else response
 
 
-def perplexity_response(text, search_results=(), status="completed"):
-    """A Perplexity Agent API result: its search results, then its answer.
-
-    The results are dicts, as the OpenAI SDK leaves them.
-    """
+def search_response(*urls):
+    """A search.create() result with a title and snippet for each URL."""
     return SimpleNamespace(
-        output=[
-            SimpleNamespace(
-                type="search_results",
-                results=[{"title": "", "url": url} for url in search_results],
-            ),
-            SimpleNamespace(
-                type="message",
-                content=[SimpleNamespace(type="output_text", text=text)],
-            ),
-        ],
-        output_text=text,
-        status=status,
-        error=None,
+        results=[
+            SimpleNamespace(url=url, title=f"Title {i}", snippet=f"Snippet {i}")
+            for i, url in enumerate(urls)
+        ]
     )
 
 
@@ -93,7 +80,7 @@ def parse_response(parsed, refusal=None, status="completed", reason=None):
 
 def truncated_output():
     """Raise what responses.parse() raises for JSON cut off by a token limit."""
-    agg.UrlList.model_validate_json('{"urls": ["https://a.ex')
+    agg.QueryList.model_validate_json('{"queries": ["a que')
 
 
 def responses_reply(content, status="completed"):
@@ -147,8 +134,8 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-class ResponsesHandler(BaseHTTPRequestHandler):
-    """A minimal Responses API endpoint; records each request's path and body."""
+class ApiHandler(BaseHTTPRequestHandler):
+    """A minimal JSON API endpoint; records each request's path and body."""
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
@@ -184,10 +171,11 @@ def server():
 
 
 @pytest.fixture
-def responses_server():
-    with serve(ResponsesHandler) as httpd:
+def api_server():
+    with serve(ApiHandler) as httpd:
         httpd.requests = []
         httpd.reply = None
+        httpd.url = f"http://127.0.0.1:{httpd.server_address[1]}"
         yield httpd
 
 
@@ -202,12 +190,13 @@ def test_import_does_not_need_api_keys():
     )
 
 
-def test_perplexity_never_falls_back_to_the_openai_key(monkeypatch):
+def test_missing_perplexity_key_raises_a_clear_error(monkeypatch):
     monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+    # The OpenAI key must not be used in its place.
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     agg._default_perplexity_client.cache_clear()
-    with pytest.raises(RuntimeError, match="PERPLEXITY_API_KEY"):
-        agg.query_models("query", openai_client=FakeClient())
+    with pytest.raises(PerplexityError, match="PERPLEXITY_API_KEY"):
+        agg.search_web(["query"])
 
 
 @pytest.mark.parametrize(
@@ -253,38 +242,6 @@ def test_normalize_url(url, expected):
 )
 def test_keep_https(urls, expected):
     assert agg.keep_https(urls) == expected
-
-
-def test_search_result_urls_reads_dicts_and_objects():
-    response = SimpleNamespace(
-        output=[
-            SimpleNamespace(type="reasoning", summary=[]),
-            # The OpenAI SDK leaves the entries of these items as dicts.
-            SimpleNamespace(
-                type="search_results",
-                results=[{"url": "https://a.example"}, {"title": "No URL"}],
-            ),
-            SimpleNamespace(
-                type="fetch_url_results",
-                contents=[{"url": "https://b.example"}],
-            ),
-            # Perplexity's SDK makes objects.
-            SimpleNamespace(
-                type="search_results",
-                results=[
-                    SimpleNamespace(url="https://c.example"),
-                    SimpleNamespace(url=None),
-                ],
-            ),
-            SimpleNamespace(type="message", content=[]),
-        ]
-    )
-
-    assert agg._search_result_urls(response) == [
-        "https://a.example",
-        "https://b.example",
-        "https://c.example",
-    ]
 
 
 @pytest.mark.parametrize(
@@ -339,288 +296,187 @@ def test_check_urls_online_ignores_malformed_urls():
     assert agg.check_urls_online(["not a url", "http://"]) == []
 
 
-def test_query_models_extracts_urls_from_the_answer_and_adds_sources():
-    perplexity = FakeClient(
-        create=perplexity_response(
-            "See https://a.example[web:1]\n",
-            search_results=["https://source.example"],
-        )
-    )
-    openai = FakeClient(
-        parse=parse_response(agg.UrlList(urls=["https://a.example"]))
-    )
-
-    urls = agg.query_models(
-        "query",
-        openai_model="gpt-test",
-        perplexity_client=perplexity,
-        openai_client=openai,
-    )
-
-    assert urls == ["https://a.example", "https://source.example"]
-    assert perplexity.calls == [
-        (
-            "create",
-            {
-                "input": f"query\n\n{agg._URL_REQUEST}",
-                "extra_body": {"preset": "medium"},
-            },
-        )
-    ]
-    [(_, parse_kwargs)] = openai.calls
-    assert parse_kwargs.keys() == DEFAULT_OPENAI_KWARGS
-    assert parse_kwargs["model"] == "gpt-test"
-    assert parse_kwargs["input"] == "See https://a.example"
-    assert parse_kwargs["text_format"] is agg.UrlList
-    assert parse_kwargs["store"] is False
-    assert parse_kwargs["reasoning"] == {"effort": "low"}
-
-
-def test_query_models_survives_a_refusal(caplog):
-    perplexity = FakeClient(
-        create=perplexity_response(
-            "Answer", search_results=["https://source.example"]
-        )
-    )
-    openai = FakeClient(parse=parse_response(None, refusal="I can't help."))
-
-    assert agg.query_models(
-        "query", perplexity_client=perplexity, openai_client=openai
-    ) == ["https://source.example"]
-    assert "I can't help." in caplog.text
-    assert agg.query_models(
-        "query",
-        include_search_results=False,
-        perplexity_client=perplexity,
-        openai_client=openai,
-    ) == []
-
-
-def test_query_models_survives_truncated_output(caplog):
-    perplexity = FakeClient(
-        create=perplexity_response(
-            "Answer", search_results=["https://source.example"]
-        )
-    )
-
-    urls = agg.query_models(
-        "query",
-        perplexity_client=perplexity,
-        openai_client=FakeClient(parse=truncated_output),
-    )
-
-    assert urls == ["https://source.example"]
-    assert "invalid structured output" in caplog.text
-
-
-def test_query_models_logs_why_there_is_no_output(caplog):
+def test_expand_query_adds_the_model_queries():
     openai = FakeClient(
         parse=parse_response(
-            None, status="incomplete", reason="max_output_tokens"
+            agg.QueryList(
+                queries=["inmobiliarias Uruguay", "query", " ", "directorio", "x"]
+            )
         )
     )
 
-    assert agg.query_models(
-        "query",
-        include_search_results=False,
-        perplexity_client=FakeClient(create=perplexity_response("Answer")),
-        openai_client=openai,
-    ) == []
-    assert "incomplete" in caplog.text
-    assert "max_output_tokens" in caplog.text
+    queries = agg.expand_query(
+        "query", 4, openai_model="gpt-test", openai_client=openai
+    )
+
+    assert queries == ["query", "inmobiliarias Uruguay", "directorio", "x"]
+    [(_, kwargs)] = openai.calls
+    assert kwargs.keys() == DEFAULT_OPENAI_KWARGS
+    assert kwargs["model"] == "gpt-test"
+    assert "Write 3 web search queries" in kwargs["instructions"]
+    assert kwargs["input"] == "query"
+    assert kwargs["text_format"] is agg.QueryList
+    assert kwargs["store"] is False
+    assert kwargs["reasoning"] == {"effort": "low"}
 
 
-def test_query_models_skips_extraction_without_an_answer():
-    perplexity = FakeClient(create=perplexity_response(" \n"))
+@pytest.mark.parametrize(
+    "parse",
+    [parse_response(None, refusal="No."), truncated_output],
+    ids=["refusal", "truncated"],
+)
+def test_expand_query_falls_back_to_the_query(parse, caplog):
+    openai = FakeClient(parse=parse)
+    assert agg.expand_query("query", openai_client=openai) == ["query"]
+    assert "structured output" in caplog.text
+
+
+def test_expand_query_with_one_query_skips_the_api():
     openai = FakeClient()
-
-    assert agg.query_models(
-        "query", perplexity_client=perplexity, openai_client=openai
-    ) == []
+    assert agg.expand_query("query", 1, openai_client=openai) == ["query"]
     assert openai.calls == []
 
 
-def test_query_models_warns_about_an_unfinished_perplexity_answer(caplog):
+def test_expand_query_rejects_zero_queries():
+    with pytest.raises(ValueError, match="num_queries"):
+        agg.expand_query("query", 0, openai_client=FakeClient())
+
+
+def test_search_web_sends_the_queries_in_batches():
+    perplexity = FakeClient(search=search_response("https://a.example"))
+    queries = [f"q{i}" for i in range(7)]
+
+    results = agg.search_web(queries, perplexity_client=perplexity)
+
+    assert [kwargs for _, kwargs in perplexity.calls] == [
+        {
+            "query": batch,
+            "max_results": agg.MAX_RESULTS_PER_QUERY,
+            "max_tokens_per_page": agg._PAGE_TOKENS,
+        }
+        for batch in (queries[:5], queries[5:])
+    ]
+    assert results == 2 * [
+        agg.SearchResult(
+            url="https://a.example", title="Title 0", snippet="Snippet 0"
+        )
+    ]
+
+
+def test_search_web_passes_the_country_and_result_count():
+    perplexity = FakeClient(search=search_response())
+
+    agg.search_web(
+        ["q"], max_results=7, country="UY", perplexity_client=perplexity
+    )
+
+    [(_, kwargs)] = perplexity.calls
+    assert kwargs["max_results"] == 7
+    assert kwargs["country"] == "UY"
+
+
+def test_search_for_web_urls_end_to_end(server, monkeypatch):
+    monkeypatch.setattr(agg, "_is_public_url", lambda url: True)
+    openai = FakeClient(parse=parse_response(agg.QueryList(queries=["alt"])))
     perplexity = FakeClient(
-        create=perplexity_response(
-            "", search_results=["https://a.example"], status="incomplete"
+        search=search_response(
+            f"{server}/ok/",
+            f"{server}/missing",
+            f"{server}/redirect",
+            # The same page as the first one, once normalized.
+            f"{server}/ok",
         )
     )
 
-    assert agg.query_models(
-        "query", perplexity_client=perplexity, openai_client=FakeClient()
-    ) == ["https://a.example"]
-    assert "incomplete" in caplog.text
-
-
-def test_query_models_raises_when_perplexity_fails():
-    response = perplexity_response("", status="failed")
-    response.error = SimpleNamespace(message="Agent crashed")
-
-    with pytest.raises(OpenAIError, match="Agent crashed"):
-        agg.query_models(
-            "query",
-            perplexity_client=FakeClient(create=response),
-            openai_client=FakeClient(),
-        )
-
-
-def test_query_models_passes_custom_model_options():
-    openai = FakeClient(parse=parse_response(agg.UrlList(urls=[])))
-
-    agg.query_models(
-        "query",
-        openai_reasoning_effort="none",
-        openai_temperature=0.7,
-        perplexity_client=FakeClient(create=perplexity_response("Answer")),
-        openai_client=openai,
+    results = agg.search_for_web_urls(
+        "query", 2, perplexity_client=perplexity, openai_client=openai
     )
 
-    [(_, kwargs)] = openai.calls
-    assert kwargs["reasoning"] == {"effort": "none"}
-    assert kwargs["temperature"] == 0.7
+    assert results == [
+        agg.SearchResult(
+            url=f"{server}/ok", title="Title 0", snippet="Snippet 0"
+        ),
+        agg.SearchResult(
+            url=f"{server}/redirect", title="Title 2", snippet="Snippet 2"
+        ),
+    ]
+    [(_, kwargs)] = perplexity.calls
+    assert kwargs["query"] == ["query", "alt"]
 
 
-def test_search_for_web_urls_passes_model_options_through():
-    perplexity = FakeClient(create=perplexity_response("Answer"))
-    openai = FakeClient(parse=parse_response(agg.UrlList(urls=[])))
+def test_search_for_web_urls_passes_the_options_through():
+    openai = FakeClient(parse=parse_response(agg.QueryList(queries=["alt"])))
+    perplexity = FakeClient(search=search_response())
 
-    agg.search_for_web_urls(
+    assert agg.search_for_web_urls(
         "query",
-        num_runs=2,
-        perplexity_preset="low",
-        perplexity_model="openai/gpt-test",
+        3,
+        max_results=7,
+        country="UY",
         openai_model="gpt-4o",
         openai_reasoning_effort=None,
         openai_temperature=0,
         perplexity_client=perplexity,
         openai_client=openai,
-    )
+    ) == []
 
-    assert len(perplexity.calls) == 2
-    for _, kwargs in perplexity.calls:
-        assert kwargs["model"] == "openai/gpt-test"
-        assert kwargs["extra_body"] == {"preset": "low"}
-    assert len(openai.calls) == 2
-    for _, kwargs in openai.calls:
-        assert kwargs["model"] == "gpt-4o"
-        assert kwargs["temperature"] == 0
-        assert "reasoning" not in kwargs
-
-
-def test_execute_query_multiple_times_merges_and_normalizes_runs():
-    perplexity = FakeClient(
-        create=perplexity_response(
-            "Answer", search_results=["https://b.example"]
-        )
-    )
-    openai = FakeClient(
-        parse=parse_response(
-            agg.UrlList(
-                urls=["https://a.example/", "HTTPS://A.example", "not a url"]
-            )
-        )
-    )
-
-    urls = agg.execute_query_multiple_times(
-        "query", num_runs=3, perplexity_client=perplexity, openai_client=openai
-    )
-
-    assert urls == ["https://a.example", "https://b.example"]
-    assert len(perplexity.calls) == 3
+    [(_, parse_kwargs)] = openai.calls
+    assert parse_kwargs["model"] == "gpt-4o"
+    assert parse_kwargs["temperature"] == 0
+    assert "reasoning" not in parse_kwargs
+    assert "Write 2 web search queries" in parse_kwargs["instructions"]
+    [(_, search_kwargs)] = perplexity.calls
+    assert search_kwargs["max_results"] == 7
+    assert search_kwargs["country"] == "UY"
 
 
-def test_execute_query_multiple_times_skips_failed_runs(caplog):
-    attempts = itertools.count()
-
-    def create():
-        if next(attempts) == 0:
-            raise OpenAIError("temporary failure")
-        return perplexity_response("", search_results=["https://a.example"])
-
-    urls = agg.execute_query_multiple_times(
-        "query",
-        num_runs=3,
-        perplexity_client=FakeClient(create=create),
-        openai_client=FakeClient(),
-    )
-
-    assert urls == ["https://a.example"]
-    assert "temporary failure" in caplog.text
-
-
-def test_execute_query_multiple_times_does_not_hide_bugs():
-    attempts = itertools.count()
-
-    def create():
-        if next(attempts) == 0:
-            raise TypeError("bug")
-        return perplexity_response("", search_results=["https://a.example"])
-
-    with pytest.raises(TypeError, match="bug"):
-        agg.execute_query_multiple_times(
-            "query",
-            num_runs=3,
-            perplexity_client=FakeClient(create=create),
-            openai_client=FakeClient(),
-        )
-
-
-def test_execute_query_multiple_times_raises_when_every_run_fails():
-    def create():
-        raise OpenAIError("model not found")
-
-    with pytest.raises(OpenAIError, match="model not found"):
-        agg.execute_query_multiple_times(
-            "query",
-            num_runs=2,
-            perplexity_client=FakeClient(create=create),
-            openai_client=FakeClient(),
-        )
-
-
-def test_execute_query_multiple_times_rejects_zero_runs():
-    with pytest.raises(ValueError, match="num_runs"):
-        agg.execute_query_multiple_times(
-            "query",
-            num_runs=0,
-            perplexity_client=FakeClient(),
-            openai_client=FakeClient(),
-        )
-
-
-def test_get_top_relevant_websites_ranks_for_the_query():
+def test_get_top_relevant_websites_ranks_and_classifies():
     selection = agg.WebsiteList(
         websites_list=[
-            agg.Website(name="A", url="https://a.example/"),
-            agg.Website(name="Made up", url="https://invented.example"),
-            agg.Website(name="B", url="http://b.example"),
-            agg.Website(name="A again", url="https://www.a.example"),
+            agg.Website(name="A", url="https://a.example/", kind="official_site"),
+            agg.Website(
+                name="Made up", url="https://invented.example", kind="other"
+            ),
+            agg.Website(name="B", url="http://b.example", kind="directory"),
+            agg.Website(
+                name="A again", url="https://www.a.example", kind="article"
+            ),
         ]
     )
     openai = FakeClient(parse=parse_response(selection))
-    input_urls = [
-        "https://www.a.example",
-        "https://b.example",
+    results = [
+        agg.SearchResult(
+            url="https://www.a.example", title="A", snippet="Agency A"
+        ),
+        agg.SearchResult(url="https://b.example", title="B", snippet="x" * 600),
+        # A plain URL works too.
         "https://c.example",
     ]
 
     websites = agg.get_top_relevant_websites(
-        input_urls,
+        results,
         query="real estate agencies",
         openai_model="gpt-test",
         openai_client=openai,
     )
 
     assert websites == [
-        agg.Website(name="A", url="https://www.a.example"),
-        agg.Website(name="B", url="https://b.example"),
+        agg.Website(name="A", url="https://www.a.example", kind="official_site"),
+        agg.Website(name="B", url="https://b.example", kind="directory"),
     ]
     [(_, kwargs)] = openai.calls
     assert kwargs.keys() == DEFAULT_OPENAI_KWARGS
     assert kwargs["model"] == "gpt-test"
     assert "real estate agencies" in kwargs["instructions"]
-    assert json.loads(kwargs["input"]) == input_urls
+    assert json.loads(kwargs["input"]) == [
+        {"url": "https://www.a.example", "title": "A", "snippet": "Agency A"},
+        {
+            "url": "https://b.example",
+            "title": "B",
+            "snippet": "x" * agg._SNIPPET_CHARS,
+        },
+        {"url": "https://c.example", "title": "", "snippet": ""},
+    ]
     assert kwargs["text_format"] is agg.WebsiteList
     assert kwargs["store"] is False
     assert kwargs["reasoning"] == {"effort": "low"}
@@ -660,16 +516,11 @@ def test_get_top_relevant_websites_passes_model_options():
 
 
 def test_api_kwargs_match_the_sdk_signatures():
-    perplexity = FakeClient(create=perplexity_response("Answer"))
-    extraction = FakeClient(parse=parse_response(agg.UrlList(urls=[])))
-    # The preset's model, then another one.
-    for model in (None, "openai/gpt-test"):
-        agg.query_models(
-            "query",
-            perplexity_model=model,
-            perplexity_client=perplexity,
-            openai_client=extraction,
-        )
+    perplexity = FakeClient(search=search_response())
+    agg.search_web(["q"], perplexity_client=perplexity)
+    agg.search_web(["q"], country="UY", perplexity_client=perplexity)
+    expansion = FakeClient(parse=parse_response(agg.QueryList(queries=[])))
+    agg.expand_query("query", openai_client=expansion)
     ranking = FakeClient(parse=parse_response(agg.WebsiteList(websites_list=[])))
     agg.get_top_relevant_websites(
         ["https://a.example"],
@@ -678,10 +529,13 @@ def test_api_kwargs_match_the_sdk_signatures():
         openai_client=ranking,
     )
 
-    with OpenAI(api_key="test") as client:
+    with (
+        OpenAI(api_key="test") as openai_client,
+        Perplexity(api_key="test") as perplexity_client,
+    ):
         signatures = {
-            "create": inspect.signature(client.responses.create),
-            "parse": inspect.signature(client.responses.parse),
+            "parse": inspect.signature(openai_client.responses.parse),
+            "search": inspect.signature(perplexity_client.search.create),
         }
     # bind() only catches a renamed or removed kwarg if there is no **kwargs.
     for signature in signatures.values():
@@ -689,8 +543,38 @@ def test_api_kwargs_match_the_sdk_signatures():
             parameter.kind is not parameter.VAR_KEYWORD
             for parameter in signature.parameters.values()
         )
-    for method, kwargs in perplexity.calls + extraction.calls + ranking.calls:
+    for method, kwargs in perplexity.calls + expansion.calls + ranking.calls:
         signatures[method].bind(**kwargs)
+
+
+def test_search_web_with_the_real_perplexity_client(api_server):
+    api_server.reply = {
+        "id": "search_test",
+        "results": [
+            {"title": "A", "url": "https://a.example", "snippet": "Agency A"},
+            {"title": "B", "url": "https://b.example", "snippet": "Agency B"},
+        ],
+    }
+
+    with Perplexity(
+        api_key="test", base_url=api_server.url, max_retries=0
+    ) as client:
+        results = agg.search_web(
+            ["q1", "q2"], country="UY", perplexity_client=client
+        )
+
+    assert results == [
+        agg.SearchResult(url="https://a.example", title="A", snippet="Agency A"),
+        agg.SearchResult(url="https://b.example", title="B", snippet="Agency B"),
+    ]
+    [(path, body)] = api_server.requests
+    assert path == "/search"
+    assert body == {
+        "query": ["q1", "q2"],
+        "max_results": agg.MAX_RESULTS_PER_QUERY,
+        "max_tokens_per_page": agg._PAGE_TOKENS,
+        "country": "UY",
+    }
 
 
 @pytest.mark.parametrize(
@@ -700,126 +584,40 @@ def test_api_kwargs_match_the_sdk_signatures():
             [
                 {
                     "type": "output_text",
-                    "text": '{"urls": ["https://a.example"]}',
+                    "text": '{"queries": ["alt one", "alt two"]}',
                     "annotations": [],
                 }
             ],
             "completed",
-            ["https://a.example"],
+            ["query", "alt one", "alt two"],
         ),
-        ([{"type": "refusal", "refusal": "No."}], "completed", []),
+        ([{"type": "refusal", "refusal": "No."}], "completed", ["query"]),
         (
             [
                 {
                     "type": "output_text",
-                    "text": '{"urls": ["https://a.ex',
+                    "text": '{"queries": ["alt',
                     "annotations": [],
                 }
             ],
             "incomplete",
-            [],
+            ["query"],
         ),
     ],
     ids=["valid", "refusal", "truncated"],
 )
-def test_query_models_with_the_real_openai_client(
-    responses_server, content, status, expected
+def test_expand_query_with_the_real_openai_client(
+    api_server, content, status, expected
 ):
-    responses_server.reply = responses_reply(content, status)
-    url = f"http://127.0.0.1:{responses_server.server_address[1]}"
+    api_server.reply = responses_reply(content, status)
 
-    with OpenAI(api_key="test", base_url=url, max_retries=0) as client:
-        urls = agg.query_models(
-            "query",
-            include_search_results=False,
-            perplexity_client=FakeClient(create=perplexity_response("Answer")),
-            openai_client=client,
-        )
+    with OpenAI(api_key="test", base_url=api_server.url, max_retries=0) as client:
+        queries = agg.expand_query("query", openai_client=client)
 
-    assert urls == expected
-    [(path, body)] = responses_server.requests
+    assert queries == expected
+    [(path, body)] = api_server.requests
     assert path == "/responses"
-    assert body["input"] == "Answer"
+    assert body["input"] == "query"
     assert body["store"] is False
     assert body["reasoning"] == {"effort": "low"}
     assert body["text"]["format"]["type"] == "json_schema"
-
-
-def test_query_models_with_the_real_perplexity_client(responses_server):
-    reply = responses_reply(
-        [
-            {
-                "type": "output_text",
-                "text": "See https://a.example[web:1]",
-                "annotations": [],
-            }
-        ]
-    )
-    # Reasoning and sources come before the answer; the SDK doesn't know the
-    # search_results and fetch_url_results items.
-    reply["output"][:0] = [
-        {
-            "type": "reasoning",
-            "id": "rs_test",
-            "summary": [
-                {"type": "summary_text", "text": "Try https://guess.example"}
-            ],
-        },
-        {
-            "type": "search_results",
-            "results": [
-                {"id": 1, "title": "Source", "url": "https://source.example"}
-            ],
-        },
-        {
-            "type": "fetch_url_results",
-            "contents": [{"title": "", "url": "https://fetched.example"}],
-        },
-    ]
-    responses_server.reply = reply
-    port = responses_server.server_address[1]
-    # The local server, under the path of Perplexity's API.
-    base_url = f"http://127.0.0.1:{port}{urlsplit(agg.PERPLEXITY_BASE_URL).path}"
-    openai = FakeClient(
-        parse=parse_response(agg.UrlList(urls=["https://a.example"]))
-    )
-
-    with OpenAI(api_key="test", base_url=base_url, max_retries=0) as client:
-        urls = agg.query_models(
-            "query", perplexity_client=client, openai_client=openai
-        )
-
-    assert urls == [
-        "https://a.example",
-        "https://source.example",
-        "https://fetched.example",
-    ]
-    [(path, body)] = responses_server.requests
-    assert path == "/v1/responses"
-    assert body == {
-        "input": f"query\n\n{agg._URL_REQUEST}",
-        "preset": agg.DEFAULT_PERPLEXITY_PRESET,
-    }
-    [(_, parse_kwargs)] = openai.calls
-    assert parse_kwargs["input"] == "See https://a.example"
-
-
-def test_search_for_web_urls_end_to_end(server, monkeypatch):
-    monkeypatch.setattr(agg, "_is_public_url", lambda url: True)
-    perplexity = FakeClient(
-        create=perplexity_response(
-            "Answer", search_results=[f"{server}/redirect"]
-        )
-    )
-    openai = FakeClient(
-        parse=parse_response(
-            agg.UrlList(urls=[f"{server}/ok/", f"{server}/missing"])
-        )
-    )
-
-    urls = agg.search_for_web_urls(
-        "query", num_runs=2, perplexity_client=perplexity, openai_client=openai
-    )
-
-    assert urls == [f"{server}/ok", f"{server}/redirect"]
-    assert len(perplexity.calls) == 2

@@ -2,22 +2,24 @@
 
 > **Note**: *This is a small experimental library, provided as-is.*
 
-**ai_url_aggregator** is a Python tool that leverages **Perplexity** and **OpenAI** to search the internet for relevant URLs, normalize and deduplicate them, check their availability, and then select the most relevant ones based on GPT analysis.
+**ai_url_aggregator** is a Python tool that leverages **Perplexity** and **OpenAI** to search the internet for relevant URLs: it expands your query into several searches, runs them, normalizes, deduplicates and checks the results, and then classifies and ranks them with GPT.
 
 ---
 
 ## Features
 
-1. **Search Across Models**  
-   Queries Perplexity’s Agent API (the `medium` preset by default, configurable) several times in parallel, asking for the website URL of each item it mentions. An OpenAI model extracts the URLs from each answer, and the pages Perplexity found while searching are added to the list.
-2. **Clean & Filter**  
+1. **Query Expansion**  
+   An OpenAI model turns your query into several search queries, varying the wording, the language and the angle (for example, directories), to find more of the websites you’re after.
+2. **Web Search**  
+   Perplexity’s Search API runs those queries (up to 5 per request, each request billed once) and returns ranked pages with their title and an extract. Every URL comes from the search index, so none are made up.
+3. **Clean & Filter**  
    - Normalizes URLs: adds `https://` to bare domains such as `www.example.com`, lowercases the host, and drops trailing slashes and fragments.  
    - Removes duplicates, preferring `https://` over `http://` and treating `www.example.com` and `example.com` as the same site.
-3. **Online Check**  
+4. **Online Check**  
    - Verifies each URL’s availability (final status `200` or `403`) concurrently with `requests`, following redirects and falling back from `HEAD` to `GET`.  
    - Skips URLs, including redirect targets, that resolve to private, loopback or other non-public addresses.
-4. **Relevance Ranking**  
-   - Uses an OpenAI model to select the websites most relevant to your query, keeping only URLs from the checked list.
+5. **Relevance Ranking**  
+   - Uses an OpenAI model to pick the pages relevant to your query, judging each by its title and extract, classifying it (official site, directory, article or other) and ordering them from most to least relevant. Only URLs from the search results are kept.
 
 ### DeepWiki Docs: [https://deepwiki.com/carlosplanchon/ai_url_aggregator](https://deepwiki.com/carlosplanchon/ai_url_aggregator)
 
@@ -49,7 +51,7 @@ Replace `"PERPLEXITY_API_KEY"` and `"OPENAI_API_KEY"` with your actual API keys.
    ```bash
    uv sync
    ```
-   This ensures all required libraries (like `openai`, `requests`, etc.) are installed, along with `pytest`.
+   This ensures all required libraries (like `openai`, `perplexityai`, `requests`, etc.) are installed, along with `pytest`.
 3. **Run the Tests**:
    ```bash
    uv run pytest
@@ -60,54 +62,58 @@ Replace `"PERPLEXITY_API_KEY"` and `"OPENAI_API_KEY"` with your actual API keys.
 
 ## How It Works
 
-1. **`query_models(query: str, ...) -> list[str]`**  
-   - Sends the query to Perplexity’s Agent API (the `medium` preset by default), asking it to include the website URL of each item it mentions, and removes citation markers such as `[web:1]` from the answer.
-   - Parses the answer with an OpenAI model (`gpt-6-luna` with low reasoning effort by default) into a structured list of URLs and adds the pages Perplexity found. The OpenAI calls use the Responses API with `store=False`, so the responses aren’t stored for later retrieval.
+1. **`expand_query(query: str, num_queries: int = 5, ...) -> list[str]`**  
+   - Returns `query` followed by up to `num_queries - 1` related queries written by an OpenAI model (`gpt-6-luna` with low reasoning effort by default).
+   - If the model refuses or its output is cut off, it logs a warning and returns just `query`.
 
-2. **`keep_https(urls: list[str]) -> list[str]`**  
+2. **`search_web(queries: Sequence[str], ...) -> list[SearchResult]`**  
+   - Runs the queries through Perplexity’s Search API, 5 per request.
+   - Returns a `SearchResult` with the `url`, `title` and `snippet` of each page found.
+
+3. **`keep_https(urls: list[str]) -> list[str]`**  
    - Normalizes the URLs (see `normalize_url`) and removes duplicates, preferring `https://` and ignoring `www.`.
    - Drops anything that isn’t an `http(s)` URL.
-
-3. **`execute_query_multiple_times(query: str, num_runs: int = 5, ...) -> list[str]`**  
-   - Runs the query multiple times in parallel to gather more URLs.
-   - Deduplicates the normalized results, keeping the order in which they were found. Runs that hit an API error are logged and skipped; if every run fails, the error is raised.
 
 4. **`check_urls_online(urls: list[str], ...) -> list[str]`**  
    - Checks the URLs concurrently and keeps the reachable ones (final status `200` or `403`).
    - Follows redirects, and tries `GET` when `HEAD` fails or returns another status, without downloading the body.
    - Treats URLs that resolve to non-public addresses as offline unless `allow_private_addresses=True`.
 
-5. **`search_for_web_urls(query: str, num_runs: int = 5, ...) -> list[str]`**  
+5. **`search_for_web_urls(query: str, num_queries: int = 5, ...) -> list[SearchResult]`**  
    - Brings all the above together:
-     1. Executes a query multiple times.
-     2. Prefers HTTPS versions of each site.
-     3. Verifies URL reachability.
-     4. Returns a final list of online, deduplicated URLs.
+     1. Expands the query.
+     2. Searches the web.
+     3. Normalizes and deduplicates the results, preferring HTTPS.
+     4. Returns the results whose URLs are online.
 
-6. **`get_top_relevant_websites(website_urls: list[str], query: str | None = None, ...) -> list[Website]`**  
-   - Uses an OpenAI model to select the most relevant websites for `query` from the final list of URLs.
+6. **`get_top_relevant_websites(results: Sequence[SearchResult | str], query: str | None = None, ...) -> list[Website]`**  
+   - Uses an OpenAI model to select the results relevant to `query`, judging each by its title and snippet, and returns them as `Website(name, url, kind)`, most relevant first. `kind` is `"official_site"`, `"directory"`, `"article"` or `"other"`.
+   - Accepts plain URLs too, although the model then has only the URL to go on.
    - Discards any URL the model returns that isn’t in the list.
    - Returns an empty list, and logs a warning, if the model refuses or its output is cut off.
 
+The OpenAI calls use the Responses API with `store=False`, so the responses aren’t stored for later retrieval.
+
 ### Configuration
 
-`query_models`, `execute_query_multiple_times` and `search_for_web_urls` accept these keyword arguments:
+`search_for_web_urls` accepts these keyword arguments:
 
 | Argument | Default | Description |
 | --- | --- | --- |
-| `perplexity_preset` | `"medium"` | Perplexity Agent API preset, which sets the model, tools, number of steps and reasoning effort. `"low"` is faster and cheaper; `"high"` researches more deeply. |
-| `perplexity_model` | `None` | Model to use instead of the preset’s, such as `"openai/gpt-5.6-luna"`. `None` keeps the preset’s model. |
-| `openai_model` | `"gpt-6-luna"` | OpenAI model that extracts the URLs. It must support Structured Outputs. |
+| `max_results` | `20` | Results per search query, the most Perplexity returns. |
+| `country` | `None` | ISO 3166-1 alpha-2 code, such as `"UY"`, to favor results from that country. |
+| `openai_model` | `"gpt-6-luna"` | OpenAI model that writes the queries. It must support Structured Outputs. |
 | `openai_reasoning_effort` | `"low"` | Reasoning effort for the OpenAI calls. `None` leaves it out, for models without reasoning such as `gpt-4o`. |
 | `openai_temperature` | `None` | Sampling temperature for the OpenAI calls. Reasoning models only accept it with `openai_reasoning_effort="none"`. `None` leaves it out. |
-| `include_search_results` | `True` | Also return the pages Perplexity found while searching and the ones it fetched. |
-| `perplexity_client` | `None` | An `openai.OpenAI` client pointed at Perplexity’s Agent API (`PERPLEXITY_BASE_URL`). |
+| `perplexity_client` | `None` | A `perplexity.Perplexity` client. |
 | `openai_client` | `None` | An `openai.OpenAI` client. Its backend must support the Responses API. |
+
+`expand_query` and `get_top_relevant_websites` accept the `openai_*` arguments, and `search_web` accepts `max_results`, `country` and `perplexity_client`.
 
 For a model without reasoning, such as `gpt-4o`, leave the reasoning effort out and set a temperature instead:
 
 ```python
-online_urls = search_for_web_urls(
+results = search_for_web_urls(
     query="...",
     openai_model="gpt-4o",
     openai_reasoning_effort=None,
@@ -115,15 +121,16 @@ online_urls = search_for_web_urls(
 )
 ```
 
-`get_top_relevant_websites` accepts `openai_model`, `openai_reasoning_effort`, `openai_temperature` and `openai_client`. Clients that aren’t passed are created from the environment variables:
+Clients that aren’t passed are created from the environment variables:
 
 ```python
 from openai import OpenAI
-from ai_url_aggregator import PERPLEXITY_BASE_URL, search_for_web_urls
+from perplexity import Perplexity
+from ai_url_aggregator import search_for_web_urls
 
-online_urls = search_for_web_urls(
+results = search_for_web_urls(
     query="...",
-    perplexity_client=OpenAI(api_key="...", base_url=PERPLEXITY_BASE_URL),
+    perplexity_client=Perplexity(api_key="..."),
     openai_client=OpenAI(api_key="..."),
 )
 ```
@@ -153,17 +160,14 @@ from ai_url_aggregator import (
 # Example query:
 query = "Give me a list of all the real estate agencies in Uruguay."
 
-# Step 1: Get a cleaned, deduplicated, and verified list of URLs
-online_urls = search_for_web_urls(query=query)
+# Step 1: Search the web and keep the unique results that are online
+results = search_for_web_urls(query=query, country="UY")
 
 print("--- Online URLs ---")
-pprint(online_urls)
+pprint([result.url for result in results])
 
-# Step 2: Get the websites most relevant to the query from the final list
-most_important_websites = get_top_relevant_websites(
-    website_urls=online_urls,
-    query=query
-)
+# Step 2: Get the websites relevant to the query, classified and ranked
+most_important_websites = get_top_relevant_websites(results, query=query)
 
 print("--- Most Important Websites ---")
 pprint(most_important_websites)
@@ -171,10 +175,10 @@ pprint(most_important_websites)
 
 Example output of step 2 (illustrative; results vary between runs):
 ```python
-[Website(name='InfoCasas', url='https://www.infocasas.com.uy'),
- Website(name='CasasWeb', url='https://www.casasweb.com.uy'),
- Website(name='Mercado Libre Inmuebles', url='https://www.mercadolibre.com.uy/inmuebles'),
- Website(name='Uruguay Inmobiliarias', url='https://www.uruguayinmobiliarias.com')]
+[Website(name='InfoCasas', url='https://www.infocasas.com.uy', kind='directory'),
+ Website(name='CasasWeb', url='https://www.casasweb.com.uy', kind='directory'),
+ Website(name='Mercado Libre Inmuebles', url='https://www.mercadolibre.com.uy/inmuebles', kind='directory'),
+ Website(name='Uruguay Inmobiliarias', url='https://www.uruguayinmobiliarias.com', kind='directory')]
 ```
 
 ---
