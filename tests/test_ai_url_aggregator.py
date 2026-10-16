@@ -247,7 +247,8 @@ def test_query_models_extracts_urls_from_the_answer_and_adds_sources():
     [(_, parse_kwargs)] = openai.calls
     assert parse_kwargs["model"] == "gpt-test"
     assert parse_kwargs["response_format"] is agg.UrlList
-    assert parse_kwargs["temperature"] == 0
+    assert parse_kwargs["reasoning_effort"] == "low"
+    assert "temperature" not in parse_kwargs
     system, user = parse_kwargs["messages"]
     assert system["role"] == "system"
     assert user == {"role": "user", "content": "See https://a.example"}
@@ -283,33 +284,40 @@ def test_query_models_skips_extraction_without_an_answer():
     assert openai.calls == []
 
 
-def test_query_models_passes_a_custom_temperature():
+def test_query_models_passes_custom_model_options():
     openai = FakeClient(parse=parse_response(agg.UrlList(urls=[])))
 
     agg.query_models(
         "query",
+        openai_reasoning_effort="none",
         openai_temperature=0.7,
         perplexity_client=FakeClient(create=perplexity_response("Answer")),
         openai_client=openai,
     )
 
     [(_, kwargs)] = openai.calls
+    assert kwargs["reasoning_effort"] == "none"
     assert kwargs["temperature"] == 0.7
 
 
-def test_search_for_web_urls_can_leave_the_temperature_out():
+def test_search_for_web_urls_passes_model_options_through():
     openai = FakeClient(parse=parse_response(agg.UrlList(urls=[])))
 
     agg.search_for_web_urls(
         "query",
         num_runs=2,
-        openai_temperature=None,
+        openai_model="gpt-4o",
+        openai_reasoning_effort=None,
+        openai_temperature=0,
         perplexity_client=FakeClient(create=perplexity_response("Answer")),
         openai_client=openai,
     )
 
     assert len(openai.calls) == 2
-    assert all("temperature" not in kwargs for _, kwargs in openai.calls)
+    for _, kwargs in openai.calls:
+        assert kwargs["model"] == "gpt-4o"
+        assert kwargs["temperature"] == 0
+        assert "reasoning_effort" not in kwargs
 
 
 def test_execute_query_multiple_times_merges_and_normalizes_runs():
@@ -422,7 +430,8 @@ def test_get_top_relevant_websites_ranks_for_the_query():
     ]
     [(_, kwargs)] = openai.calls
     assert kwargs["model"] == "gpt-test"
-    assert kwargs["temperature"] == 0
+    assert kwargs["reasoning_effort"] == "low"
+    assert "temperature" not in kwargs
     system, user = kwargs["messages"]
     assert system["role"] == "system"
     assert "real estate agencies" in system["content"]
@@ -442,15 +451,19 @@ def test_get_top_relevant_websites_returns_nothing_on_refusal():
     ) == []
 
 
-def test_get_top_relevant_websites_can_leave_the_temperature_out():
+def test_get_top_relevant_websites_passes_model_options():
     openai = FakeClient(parse=parse_response(agg.WebsiteList(websites_list=[])))
 
     agg.get_top_relevant_websites(
-        ["https://a.example"], openai_temperature=None, openai_client=openai
+        ["https://a.example"],
+        openai_reasoning_effort=None,
+        openai_temperature=0,
+        openai_client=openai,
     )
 
     [(_, kwargs)] = openai.calls
-    assert "temperature" not in kwargs
+    assert kwargs["temperature"] == 0
+    assert "reasoning_effort" not in kwargs
 
 
 def test_search_for_web_urls_end_to_end(server, monkeypatch):

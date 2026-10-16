@@ -62,7 +62,7 @@ Replace `"PERPLEXITY_API_KEY"` and `"OPENAI_API_KEY"` with your actual API keys.
 
 1. **`query_models(query: str, ...) -> list[str]`**  
    - Sends a query to Perplexity (`sonar-reasoning-pro` by default) and removes the model’s `<think>` reasoning block from the answer.
-   - Parses the answer with an OpenAI model into a structured list of URLs and adds the pages Perplexity searched.
+   - Parses the answer with an OpenAI model (`gpt-6-luna` with low reasoning effort by default) into a structured list of URLs and adds the pages Perplexity searched.
 
 2. **`keep_https(urls: list[str]) -> list[str]`**  
    - Normalizes the URLs (see `normalize_url`) and removes duplicates, preferring `https://` and ignoring `www.`.
@@ -95,13 +95,25 @@ Replace `"PERPLEXITY_API_KEY"` and `"OPENAI_API_KEY"` with your actual API keys.
 | Argument | Default | Description |
 | --- | --- | --- |
 | `perplexity_model` | `"sonar-reasoning-pro"` | Perplexity model used for the search. |
-| `openai_model` | `"gpt-4o"` | OpenAI model that extracts the URLs. It must support Structured Outputs. |
-| `openai_temperature` | `0` | Sampling temperature for the OpenAI calls. `None` leaves it out, for models that don’t accept it, such as reasoning models. |
+| `openai_model` | `"gpt-6-luna"` | OpenAI model that extracts the URLs. It must support Structured Outputs. |
+| `openai_reasoning_effort` | `"low"` | Reasoning effort for the OpenAI calls. `None` leaves it out, for models without reasoning such as `gpt-4o`. |
+| `openai_temperature` | `None` | Sampling temperature for the OpenAI calls. Reasoning models only accept it with `openai_reasoning_effort="none"`. `None` leaves it out. |
 | `include_search_results` | `True` | Also return the pages Perplexity searched. |
 | `perplexity_client` | `None` | An `openai.OpenAI` client pointed at Perplexity’s API. |
 | `openai_client` | `None` | An `openai.OpenAI` client. |
 
-`get_top_relevant_websites` accepts `openai_model`, `openai_temperature` and `openai_client`. Clients that aren’t passed are created from the environment variables:
+For a model without reasoning, such as `gpt-4o`, leave the reasoning effort out and set a temperature instead:
+
+```python
+online_urls = search_for_web_urls(
+    query="...",
+    openai_model="gpt-4o",
+    openai_reasoning_effort=None,
+    openai_temperature=0,
+)
+```
+
+`get_top_relevant_websites` accepts `openai_model`, `openai_reasoning_effort`, `openai_temperature` and `openai_client`. Clients that aren’t passed are created from the environment variables:
 
 ```python
 from openai import OpenAI
