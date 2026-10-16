@@ -4,6 +4,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import socket
 from concurrent.futures import ThreadPoolExecutor
 from functools import cache, partial
@@ -17,8 +18,9 @@ from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
 
-PERPLEXITY_BASE_URL = "https://api.perplexity.ai"
-DEFAULT_PERPLEXITY_MODEL = "sonar-reasoning-pro"
+PERPLEXITY_BASE_URL = "https://api.perplexity.ai/v1"
+# The Agent API's counterpart of the sonar-reasoning-pro model.
+DEFAULT_PERPLEXITY_PRESET = "medium"
 DEFAULT_OPENAI_MODEL = "gpt-6-luna"
 DEFAULT_OPENAI_REASONING_EFFORT = "low"
 
@@ -49,26 +51,58 @@ class UrlList(BaseModel):
     urls: list[str]
 
 
-def _strip_reasoning(text: str) -> str:
-    """Remove the <think>...</think> block that reasoning models prepend."""
-    _, marker, answer = text.rpartition("</think>")
-    if marker:
-        return answer.strip()
-    # A truncated response can end inside the block, before any answer.
-    return text.partition("<think>")[0].strip()
+# The Agent API presets cite sources by number ([web:1]) instead of by URL,
+# so the answer would otherwise have few URLs to extract.
+_URL_REQUEST = "Include the full website URL of each item you mention."
+_CITATION_RE = re.compile(r"\[[a-z_]+:\d+\]")
+
+# Perplexity's output items that list web pages, and the field with the list.
+_SOURCE_FIELDS = {"search_results": "results", "fetch_url_results": "contents"}
 
 
 def _search_result_urls(response) -> list[str]:
-    """URLs of the pages Perplexity searched, from its search_results field."""
+    """URLs of the pages Perplexity found or fetched while answering."""
     urls = []
-    for result in getattr(response, "search_results", None) or []:
-        if isinstance(result, dict):
-            url = result.get("url")
-        else:
-            url = getattr(result, "url", None)
-        if isinstance(url, str):
-            urls.append(url)
+    for item in response.output:
+        field = _SOURCE_FIELDS.get(item.type)
+        if field is None:
+            continue
+        # The OpenAI SDK doesn't know these items, so it leaves their entries
+        # as dicts; Perplexity's SDK makes objects.
+        for source in getattr(item, field, None) or []:
+            if isinstance(source, dict):
+                url = source.get("url")
+            else:
+                url = getattr(source, "url", None)
+            if isinstance(url, str):
+                urls.append(url)
     return urls
+
+
+def _ask_perplexity(
+    client: OpenAI, query: str, *, preset: str, model: str | None
+):
+    """Ask Perplexity's Agent API about `query`, requesting URLs too.
+
+    `model`, if given, replaces the preset's. A failed answer raises
+    OpenAIError; an otherwise unfinished one is logged and returned as is.
+    """
+    options = {} if model is None else {"model": model}
+    response = client.responses.create(
+        input=f"{query}\n\n{_URL_REQUEST}",
+        # The OpenAI SDK has no parameter for Perplexity's presets.
+        extra_body={"preset": preset},
+        **options,
+    )
+    if response.status == "failed":
+        message = getattr(response.error, "message", None)
+        raise OpenAIError(f"Perplexity failed to answer: {message}")
+    if response.status != "completed":
+        logger.warning(
+            "Perplexity did not complete its answer (status: %s)",
+            response.status,
+        )
+    return response
 
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
@@ -143,7 +177,8 @@ def _parse_structured(
 def query_models(
     query: str,
     *,
-    perplexity_model: str = DEFAULT_PERPLEXITY_MODEL,
+    perplexity_preset: str = DEFAULT_PERPLEXITY_PRESET,
+    perplexity_model: str | None = None,
     openai_model: str = DEFAULT_OPENAI_MODEL,
     openai_reasoning_effort: str | None = DEFAULT_OPENAI_REASONING_EFFORT,
     openai_temperature: float | None = None,
@@ -153,9 +188,11 @@ def query_models(
 ) -> list[str]:
     """Ask Perplexity about `query` and return the URLs it comes up with.
 
-    An OpenAI model extracts the URLs mentioned in the answer; if it refuses
-    or its output is cut off, that is logged and no URLs are extracted. With
-    `include_search_results`, the pages Perplexity searched are added too.
+    Perplexity answers through its Agent API with `perplexity_preset`;
+    `perplexity_model`, if given, replaces the preset's model. An OpenAI
+    model extracts the URLs mentioned in the answer; if it refuses or its
+    output is cut off, that is logged and no URLs are extracted. With
+    `include_search_results`, the pages Perplexity found are added too.
     For an OpenAI model without reasoning, such as gpt-4o, pass
     `openai_reasoning_effort=None` (and optionally `openai_temperature=0`).
     """
@@ -164,11 +201,13 @@ def query_models(
     if openai_client is None:
         openai_client = _default_openai_client()
 
-    response = perplexity_client.chat.completions.create(
+    response = _ask_perplexity(
+        perplexity_client,
+        query,
+        preset=perplexity_preset,
         model=perplexity_model,
-        messages=[{"role": "user", "content": query}],
     )
-    answer = _strip_reasoning(response.choices[0].message.content or "")
+    answer = _CITATION_RE.sub("", response.output_text).strip()
     logger.debug("Perplexity answer:\n%s", answer)
 
     urls: list[str] = []
@@ -256,7 +295,8 @@ def execute_query_multiple_times(
     query: str,
     num_runs: int = 5,
     *,
-    perplexity_model: str = DEFAULT_PERPLEXITY_MODEL,
+    perplexity_preset: str = DEFAULT_PERPLEXITY_PRESET,
+    perplexity_model: str | None = None,
     openai_model: str = DEFAULT_OPENAI_MODEL,
     openai_reasoning_effort: str | None = DEFAULT_OPENAI_REASONING_EFFORT,
     openai_temperature: float | None = None,
@@ -280,6 +320,7 @@ def execute_query_multiple_times(
     run_query = partial(
         query_models,
         query,
+        perplexity_preset=perplexity_preset,
         perplexity_model=perplexity_model,
         openai_model=openai_model,
         openai_reasoning_effort=openai_reasoning_effort,
@@ -417,7 +458,8 @@ def search_for_web_urls(
     query: str,
     num_runs: int = 5,
     *,
-    perplexity_model: str = DEFAULT_PERPLEXITY_MODEL,
+    perplexity_preset: str = DEFAULT_PERPLEXITY_PRESET,
+    perplexity_model: str | None = None,
     openai_model: str = DEFAULT_OPENAI_MODEL,
     openai_reasoning_effort: str | None = DEFAULT_OPENAI_REASONING_EFFORT,
     openai_temperature: float | None = None,
@@ -429,6 +471,7 @@ def search_for_web_urls(
     urls = execute_query_multiple_times(
         query,
         num_runs,
+        perplexity_preset=perplexity_preset,
         perplexity_model=perplexity_model,
         openai_model=openai_model,
         openai_reasoning_effort=openai_reasoning_effort,

@@ -9,7 +9,7 @@
 ## Features
 
 1. **Search Across Models**  
-   Queries Perplexity’s `sonar-reasoning-pro` model (configurable) several times in parallel. An OpenAI model extracts the URLs from each answer, and the pages Perplexity searched (`search_results`) are added to the list.
+   Queries Perplexity’s Agent API (the `medium` preset by default, configurable) several times in parallel, asking for the website URL of each item it mentions. An OpenAI model extracts the URLs from each answer, and the pages Perplexity found while searching are added to the list.
 2. **Clean & Filter**  
    - Normalizes URLs: adds `https://` to bare domains such as `www.example.com`, lowercases the host, and drops trailing slashes and fragments.  
    - Removes duplicates, preferring `https://` over `http://` and treating `www.example.com` and `example.com` as the same site.
@@ -61,8 +61,8 @@ Replace `"PERPLEXITY_API_KEY"` and `"OPENAI_API_KEY"` with your actual API keys.
 ## How It Works
 
 1. **`query_models(query: str, ...) -> list[str]`**  
-   - Sends a query to Perplexity (`sonar-reasoning-pro` by default) and removes the model’s `<think>` reasoning block from the answer.
-   - Parses the answer with an OpenAI model (`gpt-6-luna` with low reasoning effort by default) into a structured list of URLs and adds the pages Perplexity searched. The OpenAI calls use the Responses API with `store=False`, so the responses aren’t stored for later retrieval.
+   - Sends the query to Perplexity’s Agent API (the `medium` preset by default), asking it to include the website URL of each item it mentions, and removes citation markers such as `[web:1]` from the answer.
+   - Parses the answer with an OpenAI model (`gpt-6-luna` with low reasoning effort by default) into a structured list of URLs and adds the pages Perplexity found. The OpenAI calls use the Responses API with `store=False`, so the responses aren’t stored for later retrieval.
 
 2. **`keep_https(urls: list[str]) -> list[str]`**  
    - Normalizes the URLs (see `normalize_url`) and removes duplicates, preferring `https://` and ignoring `www.`.
@@ -95,12 +95,13 @@ Replace `"PERPLEXITY_API_KEY"` and `"OPENAI_API_KEY"` with your actual API keys.
 
 | Argument | Default | Description |
 | --- | --- | --- |
-| `perplexity_model` | `"sonar-reasoning-pro"` | Perplexity model used for the search. |
+| `perplexity_preset` | `"medium"` | Perplexity Agent API preset, which sets the model, tools, number of steps and reasoning effort. `"low"` is faster and cheaper; `"high"` researches more deeply. |
+| `perplexity_model` | `None` | Model to use instead of the preset’s, such as `"openai/gpt-5.6-luna"`. `None` keeps the preset’s model. |
 | `openai_model` | `"gpt-6-luna"` | OpenAI model that extracts the URLs. It must support Structured Outputs. |
 | `openai_reasoning_effort` | `"low"` | Reasoning effort for the OpenAI calls. `None` leaves it out, for models without reasoning such as `gpt-4o`. |
 | `openai_temperature` | `None` | Sampling temperature for the OpenAI calls. Reasoning models only accept it with `openai_reasoning_effort="none"`. `None` leaves it out. |
-| `include_search_results` | `True` | Also return the pages Perplexity searched. |
-| `perplexity_client` | `None` | An `openai.OpenAI` client pointed at Perplexity’s API. |
+| `include_search_results` | `True` | Also return the pages Perplexity found while searching and the ones it fetched. |
+| `perplexity_client` | `None` | An `openai.OpenAI` client pointed at Perplexity’s Agent API (`PERPLEXITY_BASE_URL`). |
 | `openai_client` | `None` | An `openai.OpenAI` client. Its backend must support the Responses API. |
 
 For a model without reasoning, such as `gpt-4o`, leave the reasoning effort out and set a temperature instead:
