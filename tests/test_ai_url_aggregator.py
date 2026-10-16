@@ -352,6 +352,7 @@ def test_search_web_sends_the_queries_in_batches():
         {
             "query": batch,
             "max_results": agg.MAX_RESULTS_PER_QUERY,
+            "max_tokens": len(batch) * agg.MAX_RESULTS_PER_QUERY * agg._PAGE_TOKENS,
             "max_tokens_per_page": agg._PAGE_TOKENS,
         }
         for batch in (queries[:5], queries[5:])
@@ -372,6 +373,7 @@ def test_search_web_passes_the_country_and_result_count():
 
     [(_, kwargs)] = perplexity.calls
     assert kwargs["max_results"] == 7
+    assert kwargs["max_tokens"] == 7 * agg._PAGE_TOKENS
     assert kwargs["country"] == "UY"
 
 
@@ -572,6 +574,7 @@ def test_search_web_with_the_real_perplexity_client(api_server):
     assert body == {
         "query": ["q1", "q2"],
         "max_results": agg.MAX_RESULTS_PER_QUERY,
+        "max_tokens": 2 * agg.MAX_RESULTS_PER_QUERY * agg._PAGE_TOKENS,
         "max_tokens_per_page": agg._PAGE_TOKENS,
         "country": "UY",
     }

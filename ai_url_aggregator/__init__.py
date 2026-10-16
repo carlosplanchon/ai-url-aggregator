@@ -205,9 +205,13 @@ def search_web(
     options = {} if country is None else {"country": country}
     results: list[SearchResult] = []
     for start in range(0, len(queries), MAX_QUERIES_PER_REQUEST):
+        batch = list(queries[start : start + MAX_QUERIES_PER_REQUEST])
         response = perplexity_client.search.create(
-            query=list(queries[start : start + MAX_QUERIES_PER_REQUEST]),
+            query=batch,
             max_results=max_results,
+            # Without a total budget, Perplexity applies its default one,
+            # which can be too small to give every page its share.
+            max_tokens=len(batch) * max_results * _PAGE_TOKENS,
             max_tokens_per_page=_PAGE_TOKENS,
             **options,
         )
