@@ -11,21 +11,33 @@ authors = [
 description = "Tool that uses Perplexity and OpenAI to search with SERP and filter for relevant URLs."
 classifiers = [
     "Intended Audience :: Developers",
-    "Topic :: Software Development :: Build Tools",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
 ]
 license = "MIT"
 license-files = ["LICENSE"]
 keywords = ["openai", "url", "research", "grabber"]
 readme = "README.md"
+requires-python = ">=3.10"
 dependencies=[
-    "openai",
+    "openai>=1.92",
+    "pydantic>=2",
     "requests"
 ]
 
 [project.urls]
 repository = "https://github.com/carlosplanchon/ai_url_aggregator.git"
+
+[dependency-groups]
+dev = [
+    "pytest>=8"
+]
 
 [tool.setuptools]
 packages = ["ai_url_aggregator"]
