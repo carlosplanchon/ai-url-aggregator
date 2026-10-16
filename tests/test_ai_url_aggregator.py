@@ -1,30 +1,47 @@
+import inspect
 import itertools
 import json
 import os
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import pytest
-from openai import OpenAIError
+from openai import OpenAI, OpenAIError
 
 import ai_url_aggregator as agg
 
+# What both OpenAI calls send with the default model options.
+DEFAULT_OPENAI_KWARGS = {
+    "model",
+    "instructions",
+    "input",
+    "text_format",
+    "store",
+    "reasoning",
+}
+
 
 class FakeClient:
-    """Stands in for openai.OpenAI and records chat.completions calls.
+    """Stands in for openai.OpenAI and records the API calls it gets.
 
-    `create` and `parse` are the responses to return, or callables that
-    produce them (and may raise).
+    Perplexity is called through chat.completions.create and OpenAI through
+    responses.parse. `create` and `parse` are the responses to return, or
+    callables that produce them (and may raise).
     """
 
     def __init__(self, create=None, parse=None):
         self.calls = []
         self._responses = {"create": create, "parse": parse}
-        self.chat = SimpleNamespace(completions=self)
+        # Expose each method only where the SDK has it.
+        self.chat = SimpleNamespace(
+            completions=SimpleNamespace(create=self.create)
+        )
+        self.responses = SimpleNamespace(parse=self.parse)
 
     def create(self, **kwargs):
         return self._respond("create", kwargs)
@@ -45,9 +62,49 @@ def perplexity_response(content, search_results=()):
     )
 
 
-def parse_response(parsed, refusal=None):
-    message = SimpleNamespace(parsed=parsed, refusal=refusal)
-    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+def parse_response(parsed, refusal=None, status="completed", reason=None):
+    """A responses.parse() result whose output_parsed is `parsed`."""
+    content = []
+    if refusal is not None:
+        content.append(SimpleNamespace(type="refusal", refusal=refusal))
+    return SimpleNamespace(
+        output_parsed=parsed,
+        # Reasoning models put a reasoning item, which has no content, first.
+        output=[
+            SimpleNamespace(type="reasoning", summary=[]),
+            SimpleNamespace(type="message", content=content),
+        ],
+        status=status,
+        incomplete_details=SimpleNamespace(reason=reason) if reason else None,
+    )
+
+
+def truncated_output():
+    """Raise what responses.parse() raises for JSON cut off by a token limit."""
+    agg.UrlList.model_validate_json('{"urls": ["https://a.ex')
+
+
+def responses_reply(content, status="completed"):
+    """The JSON body of a Responses API result with one message."""
+    return {
+        "id": "resp_test",
+        "object": "response",
+        "created_at": 0,
+        "model": "gpt-test",
+        "status": status,
+        "output": [
+            {
+                "type": "message",
+                "id": "msg_test",
+                "role": "assistant",
+                "status": "completed",
+                "content": content,
+            }
+        ],
+        "parallel_tool_calls": False,
+        "tool_choice": "auto",
+        "tools": [],
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -78,15 +135,48 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-@pytest.fixture
-def server():
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+class ResponsesHandler(BaseHTTPRequestHandler):
+    """A minimal Responses API endpoint for the real OpenAI client."""
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        self.server.requests.append(json.loads(body))
+        reply = json.dumps(self.server.reply).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(reply)))
+        self.end_headers()
+        self.wfile.write(reply)
+
+    def log_message(self, *args):
+        pass
+
+
+@contextmanager
+def serve(handler):
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(
         target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
     ).start()
-    yield f"http://127.0.0.1:{httpd.server_address[1]}"
-    httpd.shutdown()
-    httpd.server_close()
+    try:
+        yield httpd
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.fixture
+def server():
+    with serve(Handler) as httpd:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}"
+
+
+@pytest.fixture
+def responses_server():
+    with serve(ResponsesHandler) as httpd:
+        httpd.requests = []
+        httpd.reply = None
+        yield httpd
 
 
 def test_import_does_not_need_api_keys():
@@ -241,17 +331,22 @@ def test_query_models_extracts_urls_from_the_answer_and_adds_sources():
     )
 
     assert urls == ["https://a.example", "https://source.example"]
-    [(_, create_kwargs)] = perplexity.calls
-    assert create_kwargs["model"] == "sonar-test"
-    assert create_kwargs["messages"] == [{"role": "user", "content": "query"}]
+    assert perplexity.calls == [
+        (
+            "create",
+            {
+                "model": "sonar-test",
+                "messages": [{"role": "user", "content": "query"}],
+            },
+        )
+    ]
     [(_, parse_kwargs)] = openai.calls
+    assert parse_kwargs.keys() == DEFAULT_OPENAI_KWARGS
     assert parse_kwargs["model"] == "gpt-test"
-    assert parse_kwargs["response_format"] is agg.UrlList
-    assert parse_kwargs["reasoning_effort"] == "low"
-    assert "temperature" not in parse_kwargs
-    system, user = parse_kwargs["messages"]
-    assert system["role"] == "system"
-    assert user == {"role": "user", "content": "See https://a.example"}
+    assert parse_kwargs["input"] == "See https://a.example"
+    assert parse_kwargs["text_format"] is agg.UrlList
+    assert parse_kwargs["store"] is False
+    assert parse_kwargs["reasoning"] == {"effort": "low"}
 
 
 def test_query_models_survives_a_refusal(caplog):
@@ -272,6 +367,40 @@ def test_query_models_survives_a_refusal(caplog):
         perplexity_client=perplexity,
         openai_client=openai,
     ) == []
+
+
+def test_query_models_survives_truncated_output(caplog):
+    perplexity = FakeClient(
+        create=perplexity_response(
+            "Answer", search_results=["https://source.example"]
+        )
+    )
+
+    urls = agg.query_models(
+        "query",
+        perplexity_client=perplexity,
+        openai_client=FakeClient(parse=truncated_output),
+    )
+
+    assert urls == ["https://source.example"]
+    assert "invalid structured output" in caplog.text
+
+
+def test_query_models_logs_why_there_is_no_output(caplog):
+    openai = FakeClient(
+        parse=parse_response(
+            None, status="incomplete", reason="max_output_tokens"
+        )
+    )
+
+    assert agg.query_models(
+        "query",
+        include_search_results=False,
+        perplexity_client=FakeClient(create=perplexity_response("Answer")),
+        openai_client=openai,
+    ) == []
+    assert "incomplete" in caplog.text
+    assert "max_output_tokens" in caplog.text
 
 
 def test_query_models_skips_extraction_without_an_answer():
@@ -296,7 +425,7 @@ def test_query_models_passes_custom_model_options():
     )
 
     [(_, kwargs)] = openai.calls
-    assert kwargs["reasoning_effort"] == "none"
+    assert kwargs["reasoning"] == {"effort": "none"}
     assert kwargs["temperature"] == 0.7
 
 
@@ -317,7 +446,7 @@ def test_search_for_web_urls_passes_model_options_through():
     for _, kwargs in openai.calls:
         assert kwargs["model"] == "gpt-4o"
         assert kwargs["temperature"] == 0
-        assert "reasoning_effort" not in kwargs
+        assert "reasoning" not in kwargs
 
 
 def test_execute_query_multiple_times_merges_and_normalizes_runs():
@@ -429,13 +558,13 @@ def test_get_top_relevant_websites_ranks_for_the_query():
         agg.Website(name="B", url="https://b.example"),
     ]
     [(_, kwargs)] = openai.calls
+    assert kwargs.keys() == DEFAULT_OPENAI_KWARGS
     assert kwargs["model"] == "gpt-test"
-    assert kwargs["reasoning_effort"] == "low"
-    assert "temperature" not in kwargs
-    system, user = kwargs["messages"]
-    assert system["role"] == "system"
-    assert "real estate agencies" in system["content"]
-    assert json.loads(user["content"]) == input_urls
+    assert "real estate agencies" in kwargs["instructions"]
+    assert json.loads(kwargs["input"]) == input_urls
+    assert kwargs["text_format"] is agg.WebsiteList
+    assert kwargs["store"] is False
+    assert kwargs["reasoning"] == {"effort": "low"}
 
 
 def test_get_top_relevant_websites_without_urls_skips_the_api():
@@ -444,8 +573,13 @@ def test_get_top_relevant_websites_without_urls_skips_the_api():
     assert openai.calls == []
 
 
-def test_get_top_relevant_websites_returns_nothing_on_refusal():
-    openai = FakeClient(parse=parse_response(None, refusal="No."))
+@pytest.mark.parametrize(
+    "parse",
+    [parse_response(None, refusal="No."), truncated_output],
+    ids=["refusal", "truncated"],
+)
+def test_get_top_relevant_websites_returns_nothing_without_output(parse):
+    openai = FakeClient(parse=parse)
     assert agg.get_top_relevant_websites(
         ["https://a.example"], openai_client=openai
     ) == []
@@ -463,7 +597,84 @@ def test_get_top_relevant_websites_passes_model_options():
 
     [(_, kwargs)] = openai.calls
     assert kwargs["temperature"] == 0
-    assert "reasoning_effort" not in kwargs
+    assert "reasoning" not in kwargs
+
+
+def test_openai_kwargs_match_the_sdk_signature():
+    extraction = FakeClient(parse=parse_response(agg.UrlList(urls=[])))
+    agg.query_models(
+        "query",
+        perplexity_client=FakeClient(create=perplexity_response("Answer")),
+        openai_client=extraction,
+    )
+    ranking = FakeClient(parse=parse_response(agg.WebsiteList(websites_list=[])))
+    agg.get_top_relevant_websites(
+        ["https://a.example"],
+        openai_reasoning_effort=None,
+        openai_temperature=0,
+        openai_client=ranking,
+    )
+
+    with OpenAI(api_key="test") as client:
+        signature = inspect.signature(client.responses.parse)
+    # bind() only catches a renamed or removed kwarg if there is no **kwargs.
+    assert all(
+        parameter.kind is not parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    for _, kwargs in extraction.calls + ranking.calls:
+        signature.bind(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("content", "status", "expected"),
+    [
+        (
+            [
+                {
+                    "type": "output_text",
+                    "text": '{"urls": ["https://a.example"]}',
+                    "annotations": [],
+                }
+            ],
+            "completed",
+            ["https://a.example"],
+        ),
+        ([{"type": "refusal", "refusal": "No."}], "completed", []),
+        (
+            [
+                {
+                    "type": "output_text",
+                    "text": '{"urls": ["https://a.ex',
+                    "annotations": [],
+                }
+            ],
+            "incomplete",
+            [],
+        ),
+    ],
+    ids=["valid", "refusal", "truncated"],
+)
+def test_query_models_with_the_real_openai_client(
+    responses_server, content, status, expected
+):
+    responses_server.reply = responses_reply(content, status)
+    url = f"http://127.0.0.1:{responses_server.server_address[1]}"
+
+    with OpenAI(api_key="test", base_url=url, max_retries=0) as client:
+        urls = agg.query_models(
+            "query",
+            include_search_results=False,
+            perplexity_client=FakeClient(create=perplexity_response("Answer")),
+            openai_client=client,
+        )
+
+    assert urls == expected
+    [body] = responses_server.requests
+    assert body["input"] == "Answer"
+    assert body["store"] is False
+    assert body["reasoning"] == {"effort": "low"}
+    assert body["text"]["format"]["type"] == "json_schema"
 
 
 def test_search_for_web_urls_end_to_end(server, monkeypatch):

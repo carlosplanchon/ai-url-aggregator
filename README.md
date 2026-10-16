@@ -62,7 +62,7 @@ Replace `"PERPLEXITY_API_KEY"` and `"OPENAI_API_KEY"` with your actual API keys.
 
 1. **`query_models(query: str, ...) -> list[str]`**  
    - Sends a query to Perplexity (`sonar-reasoning-pro` by default) and removes the model’s `<think>` reasoning block from the answer.
-   - Parses the answer with an OpenAI model (`gpt-6-luna` with low reasoning effort by default) into a structured list of URLs and adds the pages Perplexity searched.
+   - Parses the answer with an OpenAI model (`gpt-6-luna` with low reasoning effort by default) into a structured list of URLs and adds the pages Perplexity searched. The OpenAI calls use the Responses API with `store=False`, so the responses aren’t stored for later retrieval.
 
 2. **`keep_https(urls: list[str]) -> list[str]`**  
    - Normalizes the URLs (see `normalize_url`) and removes duplicates, preferring `https://` and ignoring `www.`.
@@ -87,6 +87,7 @@ Replace `"PERPLEXITY_API_KEY"` and `"OPENAI_API_KEY"` with your actual API keys.
 6. **`get_top_relevant_websites(website_urls: list[str], query: str | None = None, ...) -> list[Website]`**  
    - Uses an OpenAI model to select the most relevant websites for `query` from the final list of URLs.
    - Discards any URL the model returns that isn’t in the list.
+   - Returns an empty list, and logs a warning, if the model refuses or its output is cut off.
 
 ### Configuration
 
@@ -100,7 +101,7 @@ Replace `"PERPLEXITY_API_KEY"` and `"OPENAI_API_KEY"` with your actual API keys.
 | `openai_temperature` | `None` | Sampling temperature for the OpenAI calls. Reasoning models only accept it with `openai_reasoning_effort="none"`. `None` leaves it out. |
 | `include_search_results` | `True` | Also return the pages Perplexity searched. |
 | `perplexity_client` | `None` | An `openai.OpenAI` client pointed at Perplexity’s API. |
-| `openai_client` | `None` | An `openai.OpenAI` client. |
+| `openai_client` | `None` | An `openai.OpenAI` client. Its backend must support the Responses API. |
 
 For a model without reasoning, such as `gpt-4o`, leave the reasoning effort out and set a temperature instead:
 

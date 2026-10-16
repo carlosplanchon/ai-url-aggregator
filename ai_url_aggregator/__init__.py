@@ -7,11 +7,12 @@ import os
 import socket
 from concurrent.futures import ThreadPoolExecutor
 from functools import cache, partial
+from typing import TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from openai import OpenAI, OpenAIError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
@@ -70,23 +71,73 @@ def _search_result_urls(response) -> list[str]:
     return urls
 
 
-def _parsed_or_none(completion):
-    """The structured output of a parse() call, or None if the model refused."""
-    message = completion.choices[0].message
-    if message.parsed is None:
-        logger.warning(
-            "OpenAI returned no structured output (refusal: %r)",
-            message.refusal,
-        )
-    return message.parsed
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+
+def _refusal(response) -> str | None:
+    """The model's refusal message in a Responses API result, if any."""
+    refusals = [
+        content.refusal
+        for item in response.output
+        if item.type == "message"
+        for content in item.content
+        if content.type == "refusal"
+    ]
+    return " ".join(refusals) or None
 
 
 def _model_options(
     temperature: float | None, reasoning_effort: str | None
-) -> dict[str, float | str]:
-    """Optional parse() kwargs, leaving out the ones that are None."""
-    options = {"temperature": temperature, "reasoning_effort": reasoning_effort}
-    return {name: value for name, value in options.items() if value is not None}
+) -> dict[str, float | dict[str, str]]:
+    """Optional responses.parse() kwargs, leaving out the ones that are None."""
+    options: dict[str, float | dict[str, str]] = {}
+    if temperature is not None:
+        options["temperature"] = temperature
+    if reasoning_effort is not None:
+        options["reasoning"] = {"effort": reasoning_effort}
+    return options
+
+
+def _parse_structured(
+    openai_client: OpenAI,
+    *,
+    model: str,
+    instructions: str,
+    user_input: str,
+    text_format: type[_ModelT],
+    temperature: float | None,
+    reasoning_effort: str | None,
+) -> _ModelT | None:
+    """Ask an OpenAI model for a `text_format` object via the Responses API.
+
+    Returns None, with a warning, if the model refuses or its output is cut
+    off or invalid.
+    """
+    try:
+        response = openai_client.responses.parse(
+            model=model,
+            instructions=instructions,
+            input=user_input,
+            text_format=text_format,
+            # The responses are never retrieved, so OpenAI needn't keep them.
+            store=False,
+            **_model_options(temperature, reasoning_effort),
+        )
+    except ValidationError as exc:
+        # The SDK raises this, not an OpenAIError, for truncated or invalid
+        # JSON, e.g. when the output hits the token limit.
+        logger.warning("OpenAI returned invalid structured output: %s", exc)
+        return None
+    parsed = response.output_parsed
+    if parsed is None:
+        logger.warning(
+            "OpenAI returned no structured output "
+            "(status: %s, reason: %s, refusal: %r)",
+            response.status,
+            getattr(response.incomplete_details, "reason", None),
+            _refusal(response),
+        )
+    return parsed
 
 
 def query_models(
@@ -102,7 +153,8 @@ def query_models(
 ) -> list[str]:
     """Ask Perplexity about `query` and return the URLs it comes up with.
 
-    An OpenAI model extracts the URLs mentioned in the answer. With
+    An OpenAI model extracts the URLs mentioned in the answer; if it refuses
+    or its output is cut off, that is logged and no URLs are extracted. With
     `include_search_results`, the pages Perplexity searched are added too.
     For an OpenAI model without reasoning, such as gpt-4o, pass
     `openai_reasoning_effort=None` (and optionally `openai_temperature=0`).
@@ -121,22 +173,18 @@ def query_models(
 
     urls: list[str] = []
     if answer:
-        completion = openai_client.chat.completions.parse(
+        url_list = _parse_structured(
+            openai_client,
             model=openai_model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Extract every website URL mentioned in the text. "
-                        "Copy them exactly and do not invent any."
-                    ),
-                },
-                {"role": "user", "content": answer},
-            ],
-            response_format=UrlList,
-            **_model_options(openai_temperature, openai_reasoning_effort),
+            instructions=(
+                "Extract every website URL mentioned in the text. "
+                "Copy them exactly and do not invent any."
+            ),
+            user_input=answer,
+            text_format=UrlList,
+            temperature=openai_temperature,
+            reasoning_effort=openai_reasoning_effort,
         )
-        url_list = _parsed_or_none(completion)
         if url_list is not None:
             urls.extend(url_list.urls)
 
@@ -414,34 +462,31 @@ def get_top_relevant_websites(
 
     Pass the original `query` so the model knows what to rank for. Only
     websites from `website_urls` are returned, with the URL as given there.
+    If the model refuses or its output is cut off, that is logged and the
+    result is empty.
     """
     if not website_urls:
         return []
     if openai_client is None:
         openai_client = _default_openai_client()
 
-    instructions = "Select the most important websites from this JSON list."
+    task = "Select the most important websites from this JSON list."
     if query:
-        instructions = (
+        task = (
             "Select the websites from this JSON list that are most relevant "
             f"to the following query.\nQuery: {query}"
         )
-    completion = openai_client.chat.completions.parse(
+    website_list = _parse_structured(
+        openai_client,
         model=openai_model,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    f"{instructions}\n"
-                    "Return a short list, using only URLs from the list."
-                ),
-            },
-            {"role": "user", "content": json.dumps(website_urls)},
-        ],
-        response_format=WebsiteList,
-        **_model_options(openai_temperature, openai_reasoning_effort),
+        instructions=(
+            f"{task}\nReturn a short list, using only URLs from the list."
+        ),
+        user_input=json.dumps(website_urls),
+        text_format=WebsiteList,
+        temperature=openai_temperature,
+        reasoning_effort=openai_reasoning_effort,
     )
-    website_list = _parsed_or_none(completion)
     if website_list is None:
         return []
 
