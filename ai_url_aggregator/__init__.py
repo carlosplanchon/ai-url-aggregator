@@ -80,11 +80,17 @@ def _parsed_or_none(completion):
     return message.parsed
 
 
+def _temperature_option(temperature: float | None) -> dict[str, float]:
+    """The `temperature` kwarg, or none at all for models that reject it."""
+    return {} if temperature is None else {"temperature": temperature}
+
+
 def query_models(
     query: str,
     *,
     perplexity_model: str = DEFAULT_PERPLEXITY_MODEL,
     openai_model: str = DEFAULT_OPENAI_MODEL,
+    openai_temperature: float | None = 0,
     include_search_results: bool = True,
     perplexity_client: OpenAI | None = None,
     openai_client: OpenAI | None = None,
@@ -93,6 +99,8 @@ def query_models(
 
     An OpenAI model extracts the URLs mentioned in the answer. With
     `include_search_results`, the pages Perplexity searched are added too.
+    Set `openai_temperature` to None for models that don't accept one,
+    such as reasoning models.
     """
     if perplexity_client is None:
         perplexity_client = _default_perplexity_client()
@@ -121,7 +129,7 @@ def query_models(
                 {"role": "user", "content": answer},
             ],
             response_format=UrlList,
-            temperature=0,
+            **_temperature_option(openai_temperature),
         )
         url_list = _parsed_or_none(completion)
         if url_list is not None:
@@ -197,6 +205,7 @@ def execute_query_multiple_times(
     *,
     perplexity_model: str = DEFAULT_PERPLEXITY_MODEL,
     openai_model: str = DEFAULT_OPENAI_MODEL,
+    openai_temperature: float | None = 0,
     include_search_results: bool = True,
     perplexity_client: OpenAI | None = None,
     openai_client: OpenAI | None = None,
@@ -219,6 +228,7 @@ def execute_query_multiple_times(
         query,
         perplexity_model=perplexity_model,
         openai_model=openai_model,
+        openai_temperature=openai_temperature,
         include_search_results=include_search_results,
         perplexity_client=perplexity_client,
         openai_client=openai_client,
@@ -354,6 +364,7 @@ def search_for_web_urls(
     *,
     perplexity_model: str = DEFAULT_PERPLEXITY_MODEL,
     openai_model: str = DEFAULT_OPENAI_MODEL,
+    openai_temperature: float | None = 0,
     include_search_results: bool = True,
     perplexity_client: OpenAI | None = None,
     openai_client: OpenAI | None = None,
@@ -364,6 +375,7 @@ def search_for_web_urls(
         num_runs,
         perplexity_model=perplexity_model,
         openai_model=openai_model,
+        openai_temperature=openai_temperature,
         include_search_results=include_search_results,
         perplexity_client=perplexity_client,
         openai_client=openai_client,
@@ -385,6 +397,7 @@ def get_top_relevant_websites(
     query: str | None = None,
     *,
     openai_model: str = DEFAULT_OPENAI_MODEL,
+    openai_temperature: float | None = 0,
     openai_client: OpenAI | None = None,
 ) -> list[Website]:
     """Ask an OpenAI model for the most relevant websites in `website_urls`.
@@ -416,7 +429,7 @@ def get_top_relevant_websites(
             {"role": "user", "content": json.dumps(website_urls)},
         ],
         response_format=WebsiteList,
-        temperature=0,
+        **_temperature_option(openai_temperature),
     )
     website_list = _parsed_or_none(completion)
     if website_list is None:

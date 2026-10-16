@@ -96,11 +96,12 @@ Replace `"PERPLEXITY_API_KEY"` and `"OPENAI_API_KEY"` with your actual API keys.
 | --- | --- | --- |
 | `perplexity_model` | `"sonar-reasoning-pro"` | Perplexity model used for the search. |
 | `openai_model` | `"gpt-4o"` | OpenAI model that extracts the URLs. It must support Structured Outputs. |
+| `openai_temperature` | `0` | Sampling temperature for the OpenAI calls. `None` leaves it out, for models that don’t accept it, such as reasoning models. |
 | `include_search_results` | `True` | Also return the pages Perplexity searched. |
 | `perplexity_client` | `None` | An `openai.OpenAI` client pointed at Perplexity’s API. |
 | `openai_client` | `None` | An `openai.OpenAI` client. |
 
-`get_top_relevant_websites` accepts `openai_model` and `openai_client`. Clients that aren’t passed are created from the environment variables:
+`get_top_relevant_websites` accepts `openai_model`, `openai_temperature` and `openai_client`. Clients that aren’t passed are created from the environment variables:
 
 ```python
 from openai import OpenAI

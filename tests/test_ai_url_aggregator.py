@@ -247,6 +247,7 @@ def test_query_models_extracts_urls_from_the_answer_and_adds_sources():
     [(_, parse_kwargs)] = openai.calls
     assert parse_kwargs["model"] == "gpt-test"
     assert parse_kwargs["response_format"] is agg.UrlList
+    assert parse_kwargs["temperature"] == 0
     system, user = parse_kwargs["messages"]
     assert system["role"] == "system"
     assert user == {"role": "user", "content": "See https://a.example"}
@@ -280,6 +281,35 @@ def test_query_models_skips_extraction_without_an_answer():
         "query", perplexity_client=perplexity, openai_client=openai
     ) == []
     assert openai.calls == []
+
+
+def test_query_models_passes_a_custom_temperature():
+    openai = FakeClient(parse=parse_response(agg.UrlList(urls=[])))
+
+    agg.query_models(
+        "query",
+        openai_temperature=0.7,
+        perplexity_client=FakeClient(create=perplexity_response("Answer")),
+        openai_client=openai,
+    )
+
+    [(_, kwargs)] = openai.calls
+    assert kwargs["temperature"] == 0.7
+
+
+def test_search_for_web_urls_can_leave_the_temperature_out():
+    openai = FakeClient(parse=parse_response(agg.UrlList(urls=[])))
+
+    agg.search_for_web_urls(
+        "query",
+        num_runs=2,
+        openai_temperature=None,
+        perplexity_client=FakeClient(create=perplexity_response("Answer")),
+        openai_client=openai,
+    )
+
+    assert len(openai.calls) == 2
+    assert all("temperature" not in kwargs for _, kwargs in openai.calls)
 
 
 def test_execute_query_multiple_times_merges_and_normalizes_runs():
@@ -392,6 +422,7 @@ def test_get_top_relevant_websites_ranks_for_the_query():
     ]
     [(_, kwargs)] = openai.calls
     assert kwargs["model"] == "gpt-test"
+    assert kwargs["temperature"] == 0
     system, user = kwargs["messages"]
     assert system["role"] == "system"
     assert "real estate agencies" in system["content"]
@@ -409,6 +440,17 @@ def test_get_top_relevant_websites_returns_nothing_on_refusal():
     assert agg.get_top_relevant_websites(
         ["https://a.example"], openai_client=openai
     ) == []
+
+
+def test_get_top_relevant_websites_can_leave_the_temperature_out():
+    openai = FakeClient(parse=parse_response(agg.WebsiteList(websites_list=[])))
+
+    agg.get_top_relevant_websites(
+        ["https://a.example"], openai_temperature=None, openai_client=openai
+    )
+
+    [(_, kwargs)] = openai.calls
+    assert "temperature" not in kwargs
 
 
 def test_search_for_web_urls_end_to_end(server, monkeypatch):
