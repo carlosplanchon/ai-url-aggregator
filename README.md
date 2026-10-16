@@ -4,6 +4,12 @@
 
 **ai-url-aggregator** is a Python tool that leverages **Perplexity** and **OpenAI** to search the internet for relevant URLs: it expands your query into several searches, runs them, normalizes, deduplicates and checks the results, and then classifies and ranks them with GPT.
 
+[![Tests](https://github.com/carlosplanchon/ai-url-aggregator/actions/workflows/tests.yml/badge.svg)](https://github.com/carlosplanchon/ai-url-aggregator/actions/workflows/tests.yml)
+[![PyPI version](https://img.shields.io/pypi/v/ai-url-aggregator.svg)](https://pypi.org/project/ai-url-aggregator/)
+[![Python versions](https://img.shields.io/pypi/pyversions/ai-url-aggregator.svg)](https://pypi.org/project/ai-url-aggregator/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/license/MIT)
+[![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/carlosplanchon/ai-url-aggregator)
+
 ---
 
 ## Features
@@ -20,8 +26,6 @@
    - Skips URLs, including redirect targets, that resolve to private, loopback or other non-public addresses.
 5. **Relevance Ranking**  
    - Uses an OpenAI model to pick the pages relevant to your query, judging each by its title and extract, classifying it (official site, directory, article or other) and ordering them from most to least relevant. Only URLs from the search results are kept.
-
-### DeepWiki Docs: [https://deepwiki.com/carlosplanchon/ai-url-aggregator](https://deepwiki.com/carlosplanchon/ai-url-aggregator)
 
 ---
 
