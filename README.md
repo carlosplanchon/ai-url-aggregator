@@ -1,8 +1,8 @@
-# ai_url_aggregator
+# ai-url-aggregator
 
 > **Note**: *This is a small experimental library, provided as-is.*
 
-**ai_url_aggregator** is a Python tool that leverages **Perplexity** and **OpenAI** to search the internet for relevant URLs: it expands your query into several searches, runs them, normalizes, deduplicates and checks the results, and then classifies and ranks them with GPT.
+**ai-url-aggregator** is a Python tool that leverages **Perplexity** and **OpenAI** to search the internet for relevant URLs: it expands your query into several searches, runs them, normalizes, deduplicates and checks the results, and then classifies and ranks them with GPT.
 
 ---
 
@@ -21,7 +21,7 @@
 5. **Relevance Ranking**  
    - Uses an OpenAI model to pick the pages relevant to your query, judging each by its title and extract, classifying it (official site, directory, article or other) and ordering them from most to least relevant. Only URLs from the search results are kept.
 
-### DeepWiki Docs: [https://deepwiki.com/carlosplanchon/ai_url_aggregator](https://deepwiki.com/carlosplanchon/ai_url_aggregator)
+### DeepWiki Docs: [https://deepwiki.com/carlosplanchon/ai-url-aggregator](https://deepwiki.com/carlosplanchon/ai-url-aggregator)
 
 ---
 
@@ -29,9 +29,13 @@
 
 ### 1. Install via PyPI
 
+Requires Python 3.11 or later.
+
 ```bash
-uv add ai_url_aggregator
+uv add ai-url-aggregator
 ```
+
+The package is imported as `ai_url_aggregator`, with underscores.
 
 ### 2. Set Environment Variables
 
@@ -100,6 +104,7 @@ The OpenAI calls use the Responses API with `store=False`, so the responses aren
 
 | Argument | Default | Description |
 | --- | --- | --- |
+| `num_queries` | `5` | Search queries to run, counting yours; the OpenAI model writes the rest. |
 | `max_results` | `20` | Results per search query, the most Perplexity returns. |
 | `country` | `None` | ISO 3166-1 alpha-2 code, such as `"UY"`, to favor results from that country. |
 | `openai_model` | `"gpt-6-luna"` | OpenAI model that writes the queries. It must support Structured Outputs. |
@@ -121,7 +126,7 @@ results = search_for_web_urls(
 )
 ```
 
-Clients that aren’t passed are created from the environment variables:
+You can pass your own clients; any client you leave out is created from the environment variables:
 
 ```python
 from openai import OpenAI
