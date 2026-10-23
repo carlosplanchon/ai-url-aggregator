@@ -406,22 +406,32 @@ def test_search_for_web_urls_end_to_end(server, monkeypatch):
     assert kwargs["query"] == ["query", "alt"]
 
 
-def test_search_for_web_urls_passes_the_options_through():
+def test_search_for_web_urls_passes_the_options_through(monkeypatch):
     openai = FakeClient(parse=parse_response(agg.QueryList(queries=["alt"])))
-    perplexity = FakeClient(search=search_response())
+    perplexity = FakeClient(search=search_response("https://a.example"))
+    check_calls = []
 
-    assert agg.search_for_web_urls(
+    def check_urls_online(urls, **kwargs):
+        check_calls.append((urls, kwargs))
+        return urls
+
+    monkeypatch.setattr(agg, "check_urls_online", check_urls_online)
+
+    results = agg.search_for_web_urls(
         "query",
         3,
         max_results=7,
         country="UY",
+        timeout=2.5,
+        max_workers=3,
         openai_model="gpt-4o",
         openai_reasoning_effort=None,
         openai_temperature=0,
         perplexity_client=perplexity,
         openai_client=openai,
-    ) == []
+    )
 
+    assert [result.url for result in results] == ["https://a.example"]
     [(_, parse_kwargs)] = openai.calls
     assert parse_kwargs["model"] == "gpt-4o"
     assert parse_kwargs["temperature"] == 0
@@ -430,6 +440,9 @@ def test_search_for_web_urls_passes_the_options_through():
     [(_, search_kwargs)] = perplexity.calls
     assert search_kwargs["max_results"] == 7
     assert search_kwargs["country"] == "UY"
+    [(check_urls, check_kwargs)] = check_calls
+    assert check_urls == ["https://a.example"]
+    assert check_kwargs == {"timeout": 2.5, "max_workers": 3}
 
 
 def test_get_top_relevant_websites_ranks_and_classifies():

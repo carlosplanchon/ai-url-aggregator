@@ -25,7 +25,7 @@
    - Removes duplicates, preferring `https://` over `http://` and treating `www.example.com` and `example.com` as the same site.
 4. **Online Check**  
    - Verifies each URL’s availability (final status `200` or `403`) concurrently with `requests`, following redirects and falling back from `HEAD` to `GET`.  
-   - Skips URLs, including redirect targets, that resolve to private, loopback or other non-public addresses.
+   - Skips URLs, including redirect targets, that resolve to private, loopback or other non-public addresses. This is a best-effort guard against SSRF: the host is resolved again when connecting, so it doesn't stop DNS rebinding.
 5. **Relevance Ranking**  
    - Uses an OpenAI model to pick the pages relevant to your query, judging each by its title and extract, classifying it (official site, directory, article or other) and ordering them from most to least relevant. Only URLs from the search results are kept.
 
@@ -113,13 +113,15 @@ The OpenAI calls use the Responses API with `store=False`, so the responses aren
 | `num_queries` | `5` | Search queries to run, counting yours; the OpenAI model writes the rest. |
 | `max_results` | `20` | Results per search query, the most Perplexity returns. |
 | `country` | `None` | ISO 3166-1 alpha-2 code, such as `"UY"`, to favor results from that country. |
+| `timeout` | `5` | Seconds to wait for each request of the online check. |
+| `max_workers` | `10` | URLs checked online at the same time. |
 | `openai_model` | `"gpt-6-luna"` | OpenAI model that writes the queries. It must support Structured Outputs. |
 | `openai_reasoning_effort` | `"low"` | Reasoning effort for the OpenAI calls. `None` leaves it out, for models without reasoning such as `gpt-4o`. |
 | `openai_temperature` | `None` | Sampling temperature for the OpenAI calls. Reasoning models only accept it with `openai_reasoning_effort="none"`. `None` leaves it out. |
 | `perplexity_client` | `None` | A `perplexity.Perplexity` client. |
 | `openai_client` | `None` | An `openai.OpenAI` client. Its backend must support the Responses API. |
 
-`expand_query` and `get_top_relevant_websites` accept the `openai_*` arguments, and `search_web` accepts `max_results`, `country` and `perplexity_client`.
+`expand_query` and `get_top_relevant_websites` accept the `openai_*` arguments, `search_web` accepts `max_results`, `country` and `perplexity_client`, and `check_urls_online` accepts `timeout`, `max_workers` and `allow_private_addresses`.
 
 For a model without reasoning, such as `gpt-4o`, leave the reasoning effort out and set a temperature instead:
 

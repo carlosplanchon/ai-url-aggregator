@@ -33,6 +33,10 @@ _SNIPPET_CHARS = 500
 # Final statuses that count as online; 403 usually means bot protection.
 ONLINE_STATUS_CODES = frozenset({200, 403})
 
+# Defaults of the online check: seconds per request, URLs checked at once.
+DEFAULT_TIMEOUT = 5
+DEFAULT_MAX_WORKERS = 10
+
 
 @cache
 def _default_perplexity_client() -> Perplexity:
@@ -359,8 +363,8 @@ def _is_online(url: str, timeout: float, allow_private_addresses: bool) -> bool:
 def check_urls_online(
     urls: list[str],
     *,
-    timeout: float = 5,
-    max_workers: int = 10,
+    timeout: float = DEFAULT_TIMEOUT,
+    max_workers: int = DEFAULT_MAX_WORKERS,
     allow_private_addresses: bool = False,
 ) -> list[str]:
     """Return the URLs whose final status is in ONLINE_STATUS_CODES.
@@ -389,6 +393,8 @@ def search_for_web_urls(
     *,
     max_results: int = MAX_RESULTS_PER_QUERY,
     country: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    max_workers: int = DEFAULT_MAX_WORKERS,
     openai_model: str = DEFAULT_OPENAI_MODEL,
     openai_reasoning_effort: str | None = DEFAULT_OPENAI_REASONING_EFFORT,
     openai_temperature: float | None = None,
@@ -399,7 +405,8 @@ def search_for_web_urls(
 
     `query` is expanded into `num_queries` queries (see expand_query), which
     Perplexity's Search API runs; the results are then normalized,
-    deduplicated and checked online.
+    deduplicated and checked online. `timeout` and `max_workers` configure
+    that check (see check_urls_online).
     """
     queries = expand_query(
         query,
@@ -418,7 +425,13 @@ def search_for_web_urls(
             perplexity_client=perplexity_client,
         )
     )
-    online = set(check_urls_online([result.url for result in results]))
+    online = set(
+        check_urls_online(
+            [result.url for result in results],
+            timeout=timeout,
+            max_workers=max_workers,
+        )
+    )
     logger.info("%d of %d unique results are online", len(online), len(results))
     return [result for result in results if result.url in online]
 
